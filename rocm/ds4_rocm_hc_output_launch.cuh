@@ -288,6 +288,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
                                                     mix_hc, mix_hc, 0);
     return cuda_ok(cudaGetLastError(), "hc_expand_split launch");
 }
+
 extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     uint64_t n_tokens64 = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
     if (!out_hc || !block_out_h || !residual_hc || !split ||
@@ -320,6 +321,7 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const
                                                          mix_hc, mix_hc);
     return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
 }
+
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
     if (!out_hc || !block_out || !block_add || !residual_hc || !split ||
@@ -355,6 +357,54 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
 }
+
+extern "C" int ds4_gpu_rocm_hc_expand_add_moe_f16_split_tensor(
+        ds4_gpu_tensor *out_hc,
+        const ds4_gpu_tensor *routed_down_h,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_expert) {
+    uint64_t n_tokens64 = 0;
+    uint64_t flat_bytes = 0;
+    uint64_t routed_half_bytes = 0;
+    uint64_t hc_bytes = 0;
+    uint64_t split_bytes = 0;
+    uint64_t mix_hc64 = 0;
+    if (!out_hc || !routed_down_h || !block_add || !residual_hc || !split ||
+        n_hc != 4u || n_expert == 0u ||
+        !cuda_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !cuda_hc_mix_width(n_hc, &mix_hc64) ||
+        !cuda_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !cuda_u64_mul3_checked(
+                n_tokens64, (uint64_t)n_expert * n_embd, sizeof(__half),
+                &routed_half_bytes) ||
+        !cuda_u64_mul3_checked(
+                n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !cuda_u64_mul3_checked(
+                n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        routed_down_h->bytes < routed_half_bytes ||
+        block_add->bytes < flat_bytes ||
+        residual_hc->bytes < hc_bytes ||
+        split->bytes < split_bytes) {
+        return 0;
+    }
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    hc_expand4_add_moe_f16_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)out_hc->ptr,
+            (const __half *)routed_down_h->ptr,
+            (const float *)block_add->ptr,
+            (const float *)residual_hc->ptr,
+            (const float *)split->ptr,
+            n_embd,
+            n_expert,
+            n_tokens);
+    return cuda_ok(cudaGetLastError(), "hc_expand_add_moe_f16_split4 launch");
+}
+
 extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     uint64_t n_tokens64 = 0, flat_bytes = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
     if (!out_hc || !block_out || !block_add_h || !residual_hc || !split ||

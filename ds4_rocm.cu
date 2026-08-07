@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "cuda/mmq/ds4_mmq.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -61,6 +62,19 @@ struct ds4_gpu_tensor {
     uint64_t bytes;
     int owner;
 };
+
+static int g_rocm_mmq_ready;
+static int g_rocm_gfx1151;
+
+// The CUDA backend can reuse producer-emitted Q8_1 activations. ROCm does not
+// own that registry yet, so MMQ takes its regular activation-quantize path.
+extern "C" int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, const void **q81) {
+    (void)src;
+    (void)in_dim;
+    if (q81) *q81 = NULL;
+    return 0;
+}
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];

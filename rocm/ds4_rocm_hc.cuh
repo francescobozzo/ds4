@@ -230,6 +230,47 @@ __global__ static void hc_expand4_add_kernel(
     }
 }
 
+__global__ static void hc_expand4_add_moe_f16_kernel(
+        float *out_hc,
+        const half *routed_down_h,
+        const float *block_add,
+        const float *residual_hc,
+        const float *split,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t d = gid % n_embd;
+    const uint32_t t = gid / n_embd;
+    const uint64_t td = (uint64_t)t * n_embd + d;
+    float routed = 0.0f;
+#pragma unroll
+    for (uint32_t e = 0; e < n_expert; e++) {
+        routed += __half2float(
+                routed_down_h[((uint64_t)t * n_expert + e) * n_embd + d]);
+    }
+    const float bv = routed + block_add[td];
+    const uint64_t hc_base = (uint64_t)t * 4u * n_embd + d;
+    const float r0 = residual_hc[hc_base + 0u * (uint64_t)n_embd];
+    const float r1 = residual_hc[hc_base + 1u * (uint64_t)n_embd];
+    const float r2 = residual_hc[hc_base + 2u * (uint64_t)n_embd];
+    const float r3 = residual_hc[hc_base + 3u * (uint64_t)n_embd];
+    const float *sp = split + (uint64_t)t * 24u;
+    const float *post = sp + 4u;
+    const float *comb = sp + 8u;
+#pragma unroll
+    for (uint32_t dst = 0; dst < 4u; dst++) {
+        float acc = bv * post[dst];
+        acc += comb[0u * 4u + dst] * r0;
+        acc += comb[1u * 4u + dst] * r1;
+        acc += comb[2u * 4u + dst] * r2;
+        acc += comb[3u * 4u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+    }
+}
+
 __global__ static void hc_expand4_half_kernel(
         float *out_hc,
         const __half *block_out,

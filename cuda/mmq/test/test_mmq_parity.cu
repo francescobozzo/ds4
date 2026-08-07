@@ -18,6 +18,12 @@
 //        -I/path/to/cuda/mmq \
 //        test_mmq_parity.cu libds4mmq.a -lcudart -lcublas -lcuda \
 //        -o test_mmq_parity
+//
+// HIP:
+//   hipcc -O3 -ffast-math -std=c++17 --offload-arch=gfx1151 \
+//        -DGGML_USE_HIP -DGGML_HIP_NO_VMM -I/path/to/cuda/mmq \
+//        test_mmq_parity.cu libds4mmq-hip.a -lhipblas \
+//        -o test_mmq_parity_hip
 
 #include "ds4_mmq.h"
 #include "iq2_host_tables.h"
@@ -32,12 +38,21 @@
 // We DON'T use the host IQ2 lookup tables from this mode (they'd be
 // __device__).  iq2_host_tables.h instead provides plain host const
 // arrays generated directly from ggml-common.h's bit-for-bit contents.
+#if defined(GGML_USE_HIP)
+#define GGML_COMMON_DECL_HIP
+#define GGML_COMMON_IMPL_HIP
+#else
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
+#endif
 #include "../ggml-common.h"
 
+#if defined(GGML_USE_HIP)
+#include "../vendors/hip.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -47,6 +62,16 @@
 #include <cstring>
 #include <random>
 #include <vector>
+
+// Standalone MMQ tests do not link the backend-owned activation-fold
+// registry. Returning no hit exercises the regular quantization path.
+extern "C" int ds4_cuda_q8_fold_take_q81(
+        const void * src, uint64_t in_dim, const void ** q81) {
+    (void)src;
+    (void)in_dim;
+    if (q81) *q81 = nullptr;
+    return 0;
+}
 
 namespace {
 
@@ -1197,6 +1222,13 @@ int main(int argc, char ** argv) {
         "IQ2_XXS", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC0FE10, gen_iq2,
         ds4_mmq_iq2_xxs_moe_pair, ds4_mmq_iq2_xxs_moe);
+    all_ok &= run_moe_pair_generic<block_iq2_xxs>(
+        "IQ2_XXS/TOKEN_BOUND", QK_K_LOCAL,
+        // Keep both control and candidate on the production X=80 template
+        // while still reducing the candidate's routed-column grid by 6x.
+        /*M=*/64, /*K=*/256, /*nt=*/160,
+        /*ne=*/16, /*nu=*/6, 0xC0FE11, gen_iq2,
+        ds4_mmq_iq2_xxs_moe_pair_token_bound, ds4_mmq_iq2_xxs_moe);
     all_ok &= run_moe_pair_generic<block_q4_K>(
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,

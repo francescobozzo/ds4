@@ -1180,7 +1180,10 @@ static __global__ void ds4_swiglu_weighted_f32(
 // structure mirrors ds4_mmq_moe_impl above; the only differences are the
 // two W pointers, the two output pointers, and the second mul_mat_q_case
 // launch with a fresh (x, dst) pair.
-template <ggml_type type, bool profile_fused_prefill = false>
+template <
+    ggml_type type,
+    bool profile_fused_prefill = false,
+    bool token_expert_unique = false>
 int ds4_mmq_moe_pair_impl(
         const char    * tag,
         const void    * W_a,
@@ -1378,11 +1381,10 @@ int ds4_mmq_moe_pair_impl(
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
-    /* The fused target-prefill path receives a true top-k assignment: one
-     * token cannot select the same expert twice, so no expert bucket can
-     * exceed n_tokens rows. Keep the conservative gathered-row bound for all
-     * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
+    /* True top-k assignments cannot select one expert twice for a token, so
+     * no expert bucket can exceed n_tokens rows. Keep the conservative
+     * gathered-row bound for generic MMQ callers, including DSpark/MTP. */
+    const int64_t routed_ncols_max = fused_down || token_expert_unique
         ? (int64_t)n_tokens
         : ne_get_rows;
 
@@ -1391,9 +1393,17 @@ int ds4_mmq_moe_pair_impl(
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
     ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
-    char *src1_q8_1 = direct_gateup_q8
-        ? (char *)fused_down->input_q8_scratch
-        : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+    char *src1_q8_1 = nullptr;
+    if (direct_gateup_q8) {
+        src1_q8_1 = (char *)fused_down->input_q8_scratch;
+#if defined(GGML_USE_HIP)
+    } else if (g_aligned_q81_scratch_ptr &&
+               g_aligned_q81_scratch_bytes >= nbytes_src1_q8_1) {
+        src1_q8_1 = (char *)g_aligned_q81_scratch_ptr;
+#endif
+    } else {
+        src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
+    }
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1869,6 +1879,17 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
         cudaStream_t stream) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
+        M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_token_bound(
+        const void * W_a, const void * W_b,
+        const float * X, const int32_t * ids, float * out_a, float * out_b,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, false, true>(
+        "ds4_mmq_iq2_xxs_moe_pair_token_bound",
+        W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 

@@ -367,6 +367,63 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int fast_window_attention = !g_quality_mode;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    if (!use_comp_mask && !g_quality_mode && g_rocm_gfx1151 &&
+        n_tokens >= 128u && n_comp != 0u && n_head == 64u &&
+        head_dim == 512u && window <= 256u) {
+        float *wmma_score_cache = NULL;
+        uint32_t wmma_score_stride = 0u;
+        const uint64_t stride64 =
+            (uint64_t)DS4_ROCM_ATTENTION_RAW_SCORE_CAP + n_comp;
+        uint64_t score_bytes = 0u;
+        if (stride64 <= UINT32_MAX &&
+            cuda_u64_mul3_checked(
+                n_tokens,
+                (uint64_t)n_head * stride64,
+                sizeof(float),
+                &score_bytes) &&
+            score_bytes <= (1ull << 30u)) {
+            wmma_score_cache = (float *)cuda_tmp_alloc(
+                score_bytes, "mixed attention WMMA scores");
+            if (wmma_score_cache) {
+                wmma_score_stride = (uint32_t)stride64;
+            }
+        }
+        const dim3 grid(n_tokens, n_head / 32u, 1u);
+        attention_mixed_heads32_wmma_kernel<false><<<grid, 1024>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            (const float *)comp_kv->ptr,
+            NULL,
+            wmma_score_cache,
+            wmma_score_stride,
+            n_tokens,
+            pos0,
+            n_raw,
+            raw_cap,
+            raw_start,
+            n_comp,
+            0u,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "mixed-window prefill using wave32 rocWMMA "
+                    "(token=1, heads=32, rows=16, score-cache=%s)\n",
+                    wmma_score_cache ? "on" : "off");
+            notice_printed = 1;
+        }
+        return cuda_ok(
+            cudaGetLastError(),
+            "attention mixed-window wave32 wmma launch");
+    }
+#endif
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -533,10 +590,44 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return cuda_ok(cudaGetLastError(), "attention indexed decode oldhip fast launch");
     }
+    float *wmma_score_cache = NULL;
+    uint32_t wmma_score_stride = 0u;
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        int32_t *sorted = (int32_t *)cuda_tmp_alloc(sort_bytes, "indexed attention topk sort");
+        const uint64_t sort_aligned = (sort_bytes + 255u) & ~255ull;
+        uint64_t tmp_bytes = sort_aligned;
+        const int want_score_cache =
+            !g_quality_mode && g_rocm_gfx1151 &&
+            n_tokens >= 128u && n_head == 64u && window <= 256u;
+        if (want_score_cache) {
+            const uint32_t stride =
+                DS4_ROCM_ATTENTION_RAW_SCORE_CAP + top_k;
+            uint64_t score_bytes = 0u;
+            uint64_t combined_bytes = 0u;
+            if (cuda_u64_mul3_checked(
+                    n_tokens,
+                    (uint64_t)n_head * stride,
+                    sizeof(float),
+                    &score_bytes) &&
+                score_bytes <= (1ull << 30u) &&
+                cuda_u64_add_checked(
+                    sort_aligned, score_bytes, &combined_bytes)) {
+                wmma_score_stride = stride;
+                tmp_bytes = combined_bytes;
+            }
+        }
+        char *scratch = (char *)cuda_tmp_alloc(
+            tmp_bytes, "indexed attention topk and WMMA scores");
+        if (!scratch && wmma_score_stride != 0u) {
+            wmma_score_stride = 0u;
+            scratch = (char *)cuda_tmp_alloc(
+                sort_bytes, "indexed attention topk sort");
+        }
+        int32_t *sorted = (int32_t *)scratch;
         if (!sorted) return 0;
+        if (wmma_score_stride != 0u) {
+            wmma_score_cache = (float *)(scratch + sort_aligned);
+        }
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
@@ -545,25 +636,87 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         head_dim == 512 &&
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (!g_quality_mode && g_rocm_gfx1151 &&
+            n_tokens >= 128u && n_head == 64u && top_k == 512u &&
+            window <= 256u) {
+            const dim3 grid(n_tokens, n_head / 32u, 1u);
+            attention_mixed_heads32_wmma_kernel<true><<<grid, 1024>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                topk_ptr,
+                wmma_score_cache,
+                wmma_score_stride,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                top_k,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+            static int notice_printed = 0;
+            if (!notice_printed) {
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX
+                        "indexed prefill using wave32 rocWMMA "
+                        "(token=1, heads=32, rows=16, score-cache=%s)\n",
+                        wmma_score_cache ? "on" : "off");
+                notice_printed = 1;
+            }
+            return cuda_ok(
+                cudaGetLastError(),
+                "attention indexed wave32 wmma launch");
+        }
         if (!g_quality_mode && n_head <= 64u) {
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
-            attention_indexed_mixed_heads8_online_kernel<8, 32><<<grid, 1024>>>((float *)heads->ptr,
-                                                                                sinks,
-                                                                                (const float *)q->ptr,
-                                                                                (const float *)raw_kv->ptr,
-                                                                                (const float *)comp_kv->ptr,
-                                                                                topk_ptr,
-                                                                                n_tokens,
-                                                                                pos0,
-                                                                                n_raw,
-                                                                                raw_cap,
-                                                                                raw_start,
-                                                                                n_comp,
-                                                                                top_k,
-                                                                                window,
-                                                                                ratio,
-                                                                                n_head,
-                                                                                head_dim);
+            const int use_rows16 = g_rocm_gfx1151;
+            if (use_rows16) {
+                attention_indexed_mixed_heads8_online_kernel<16, 32>
+                    <<<grid, 1024>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        (const float *)raw_kv->ptr,
+                        (const float *)comp_kv->ptr,
+                        topk_ptr,
+                        n_tokens,
+                        pos0,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        top_k,
+                        window,
+                        ratio,
+                        n_head,
+                        head_dim);
+            } else {
+                attention_indexed_mixed_heads8_online_kernel<8, 32>
+                    <<<grid, 1024>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        (const float *)raw_kv->ptr,
+                        (const float *)comp_kv->ptr,
+                        topk_ptr,
+                        n_tokens,
+                        pos0,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        top_k,
+                        window,
+                        ratio,
+                        n_head,
+                        head_dim);
+            }
             return cuda_ok(cudaGetLastError(), "attention indexed online heads32 launch");
         }
 #endif
@@ -961,7 +1114,7 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
                                        q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
-extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
+static int cuda_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,
         ds4_gpu_tensor       *low,
         const void             *model_map,
@@ -1012,7 +1165,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     if (!tmp) return 0;
     __half *heads_h = (__half *)tmp;
     __half *low_h = (__half *)((char *)tmp + low_h_offset);
-    attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255u) / 256u, 256>>>(
+    attention_pack_group_heads_f16_kernel<<<
+            (heads_h_count + 255u) / 256u, 256>>>(
             heads_h,
             (const float *)heads->ptr,
             n_tokens,
@@ -1069,7 +1223,27 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
                       CUBLAS_GEMM_DEFAULT);
     return st == CUBLAS_STATUS_SUCCESS;
 }
-extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+
+extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
+        ds4_gpu_tensor       *out_h,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    return cuda_attention_output_q8_batch_f16_tensor(
+            out_h, low, model_map, model_size,
+            out_a_offset, out_b_offset, group_dim, rank, n_groups, out_dim,
+            heads, n_tokens);
+}
+
+static int cuda_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -1083,7 +1257,18 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        int                     fuse_inverse_rope,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
     (void)group_tmp;
     (void)low_tmp;
     if (!out || !low || !heads || !model_map ||
@@ -1112,6 +1297,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     const int attn_output_cublas =
         cuda_runtime_config()->attention_output_cublas_all &&
         (n_tokens == 1u || !g_ssd_streaming_mode);
+    if (fuse_inverse_rope && !attn_output_cublas) return 0;
     if (!attn_output_cublas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
@@ -1178,12 +1364,37 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 if (!tmp) return 0;
                 __half *heads_h = (__half *)tmp;
                 __half *low_h = (__half *)((char *)tmp + low_h_offset);
-                attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
-                        heads_h,
-                        (const float *)heads->ptr,
-                        n_tokens,
-                        n_groups,
-                        group_dim);
+                if (fuse_inverse_rope) {
+                    if (head_dim == 0u || group_dim % head_dim != 0u ||
+                        n_rot > head_dim || (n_rot & 1u) != 0u) {
+                        return 0;
+                    }
+                    attention_inverse_rope_pack_group_heads_f16_kernel<<<
+                            (heads_h_count / 2u + 255u) / 256u, 256>>>(
+                            heads_h,
+                            (const float *)heads->ptr,
+                            n_tokens,
+                            n_groups,
+                            group_dim,
+                            head_dim,
+                            n_rot,
+                            pos0,
+                            n_ctx_orig,
+                            freq_base,
+                            freq_scale,
+                            ext_factor,
+                            attn_factor,
+                            beta_fast,
+                            beta_slow);
+                } else {
+                    attention_pack_group_heads_f16_kernel<<<
+                            (heads_h_count + 255u) / 256u, 256>>>(
+                            heads_h,
+                            (const float *)heads->ptr,
+                            n_tokens,
+                            n_groups,
+                            group_dim);
+                }
                 if (!cuda_ok(cudaGetLastError(), "attention_output_q8 packed heads pack launch")) return 0;
                 const float alpha = 1.0f;
                 const float beta0 = 0.0f;
@@ -1215,6 +1426,19 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     const __half *b_ptr = out_b_f16_t ? out_b_f16_t : out_b_f16;
                     const auto b_op = out_b_f16_t ? CUBLAS_OP_N : CUBLAS_OP_T;
                     const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
+                    int b_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+                    b_ok = hipblaslt_gemm_f16(out->ptr,
+                                              b_ptr,
+                                              low_h,
+                                              (uint32_t)out_dim,
+                                              n_tokens,
+                                              (uint32_t)low_dim,
+                                              b_op,
+                                              HIP_R_32F,
+                                              "attention output b");
+#endif
+                    if (b_ok) return 1;
                     st = cublasGemmEx(g_cublas,
                                       b_op,
                                       CUBLAS_OP_N,
@@ -1280,12 +1504,37 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
-        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
-                heads_h,
-                (const float *)heads->ptr,
-                n_tokens,
-                n_groups,
-                group_dim);
+        if (fuse_inverse_rope) {
+            if (head_dim == 0u || group_dim % head_dim != 0u ||
+                n_rot > head_dim || (n_rot & 1u) != 0u) {
+                return 0;
+            }
+            attention_inverse_rope_pack_group_heads_f16_kernel<<<
+                    (heads_h_count / 2u + 255u) / 256u, 256>>>(
+                    heads_h,
+                    (const float *)heads->ptr,
+                    n_tokens,
+                    n_groups,
+                    group_dim,
+                    head_dim,
+                    n_rot,
+                    pos0,
+                    n_ctx_orig,
+                    freq_base,
+                    freq_scale,
+                    ext_factor,
+                    attn_factor,
+                    beta_fast,
+                    beta_slow);
+        } else {
+            attention_pack_group_heads_f16_kernel<<<
+                    (heads_h_count + 255u) / 256u, 256>>>(
+                    heads_h,
+                    (const float *)heads->ptr,
+                    n_tokens,
+                    n_groups,
+                    group_dim);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a pack launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -1321,6 +1570,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
+        if (fuse_inverse_rope) return 0;
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -1374,6 +1624,65 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
+
+extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    return cuda_attention_output_q8_batch_tensor(
+            out, low, group_tmp, low_tmp,
+            model_map, model_size, out_a_offset, out_b_offset,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens,
+            0, 0u, 0u, 0u, 0u,
+            0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+extern "C" int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    if (n_tokens < 128u) return 0;
+    return cuda_attention_output_q8_batch_tensor(
+            out, low, group_tmp, low_tmp,
+            model_map, model_size, out_a_offset, out_b_offset,
+            group_dim, rank, n_groups, out_dim, heads, n_tokens,
+            1, head_dim, n_rot, pos0, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow);
+}
+
 extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

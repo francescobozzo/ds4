@@ -5828,8 +5828,10 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
+    g_rocm_gfx1151 = 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        g_rocm_gfx1151 = prop.major == 11 && prop.minor == 5;
         fprintf(stderr, DS4_GPU_LOG_PREFIX "backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
     }
@@ -5846,6 +5848,9 @@ extern "C" int ds4_gpu_init(void) {
         }
     }
 #endif
+    g_rocm_mmq_ready = g_rocm_gfx1151 && ds4_mmq_init(dev) == 0;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "native MMQ %s\n",
+            g_rocm_mmq_ready ? "enabled" : "unavailable");
     return 1;
 }
 

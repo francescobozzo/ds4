@@ -9,8 +9,13 @@
 
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -44,7 +49,15 @@ const ggml_cuda_device_info & ggml_cuda_info() {
         for (int i = 0; i < count; i++) {
             cudaDeviceProp p;
             CUDA_CHECK(cudaGetDeviceProperties(&p, i));
+#if defined(GGML_USE_HIP)
+            unsigned arch = 0;
+            if (sscanf(p.gcnArchName, "gfx%x", &arch) != 1) {
+                fprintf(stderr, "ggml_cuda_info: unsupported HIP architecture '%s'\n", p.gcnArchName);
+            }
+            info.devices[i].cc                          = GGML_CUDA_CC_OFFSET_AMD + (int)arch;
+#else
             info.devices[i].cc                          = p.major * 100 + p.minor * 10;
+#endif
             info.devices[i].nsm                         = p.multiProcessorCount;
             info.devices[i].smpb                        = p.sharedMemPerBlock;
             info.devices[i].smpbo                       = p.sharedMemPerBlockOptin;

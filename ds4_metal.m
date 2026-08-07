@@ -40358,8 +40358,12 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
+        bool                    defer_down_sum,
+        bool                   *down_sum_deferred,
         bool                    force_resident) {
     (void)force_resident;
+    (void)defer_down_sum;
+    if (down_sum_deferred) *down_sum_deferred = false;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
      * expert range and rebase ids in the kernels. */

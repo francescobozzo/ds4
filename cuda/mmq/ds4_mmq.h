@@ -14,7 +14,14 @@
 
 #pragma once
 
+#if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#ifndef cudaStream_t
+typedef hipStream_t cudaStream_t;
+#endif
+#else
 #include <cuda_runtime.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -284,6 +291,23 @@ int ds4_mmq_mxfp4_moe(
 // Returns 0 on success; on error neither output is guaranteed valid.
 
 int ds4_mmq_iq2_xxs_moe_pair(
+    const void    * W_a,
+    const void    * W_b,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_a,
+    float         * out_b,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Same operation, with the additional contract that each token's selected
+// experts are unique. This permits an n_tokens upper bound for every expert
+// bucket instead of n_tokens * n_expert_used.
+int ds4_mmq_iq2_xxs_moe_pair_token_bound(
     const void    * W_a,
     const void    * W_b,
     const float   * X_f32,

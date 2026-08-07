@@ -3,7 +3,14 @@
 
 #pragma once
 
+#if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#ifndef cudaStream_t
+typedef hipStream_t cudaStream_t;
+#endif
+#else
 #include <cuda_runtime.h>
+#endif
 
 #include <stddef.h>
 #include <stdint.h>

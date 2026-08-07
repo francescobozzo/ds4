@@ -209,6 +209,19 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (hipblaslt_gemm_f16(out->ptr,
+                           w_f16,
+                           xh,
+                           (uint32_t)out_dim,
+                           (uint32_t)n_tok,
+                           (uint32_t)in_dim,
+                           HIPBLAS_OP_T,
+                           HIP_R_32F,
+                           label ? label : "q8 f16 projection")) {
+        return 1;
+    }
+#endif
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -266,6 +279,19 @@ static int cuda_matmul_q8_0_tensor_f16_gemm_out_half(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16-out activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (hipblaslt_gemm_f16(out_h->ptr,
+                           w_f16,
+                           xh,
+                           (uint32_t)out_dim,
+                           (uint32_t)n_tok,
+                           (uint32_t)in_dim,
+                           HIPBLAS_OP_T,
+                           HIP_R_16F,
+                           label ? label : "q8 f16-out projection")) {
+        return 1;
+    }
+#endif
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -329,6 +355,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+    if (n_tok > 1u && !g_quality_mode && g_rocm_mmq_ready &&
+        ds4_mmq_q8_0_dense(
+            wptr,
+            (const float *)x->ptr,
+            (float *)out->ptr,
+            (int)out_dim,
+            (int)n_tok,
+            (int)in_dim,
+            (cudaStream_t)0) == 0) {
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "dense Q8 prefill using native HIP MMQ\n");
+            notice_printed = 1;
+        }
+        return 1;
+    }
     if (n_tok == 1 && !cuda_q8_prequant_decode_enabled()) {
         const bool extended_sharedx =
             in_dim > 8192u &&
@@ -392,18 +436,35 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
+            const int use_n128 = g_rocm_gfx1151;
             const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
-                            (uint32_t)((n_tok + 63u) / 64u),
+                            (uint32_t)((n_tok + (use_n128 ? 127u : 63u)) /
+                                       (use_n128 ? 128u : 64u)),
                             1u);
+            if (use_n128) {
+                matmul_q8_0_f32_batch_wmma_4w_n128_kernel<<<grid, 128u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(
+                    cudaGetLastError(),
+                    "matmul_q8_0 f32 batch wmma 4w n128 launch");
+            }
             matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
-                    (float *)out->ptr,
-                    reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)n_tok,
-                    (uint32_t)in_dim,
-                    (uint32_t)out_dim,
-                    blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr),
+                (const float *)x->ptr,
+                (uint32_t)n_tok,
+                (uint32_t)in_dim,
+                (uint32_t)out_dim,
+                blocks * 34u);
+            return cuda_ok(
+                cudaGetLastError(),
+                "matmul_q8_0 f32 batch wmma 4w launch");
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
@@ -822,6 +883,19 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+        if (hipblaslt_gemm_f16(out->ptr,
+                               w,
+                               xh,
+                               (uint32_t)out_dim,
+                               (uint32_t)n_tok,
+                               (uint32_t)in_dim,
+                               HIPBLAS_OP_T,
+                               HIP_R_32F,
+                               "f16 projection")) {
+            return 1;
+        }
+#endif
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -868,6 +942,70 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_f16_f16_input_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x_h,
+        uint64_t n_tok) {
+    if (!out || !x_h || !model_map || !g_cublas_ready || n_tok < 128u ||
+        in_dim == 0u || out_dim == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(__half), &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(__half), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        x_h->bytes < x_bytes || out->bytes < out_bytes) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "f16_half_input");
+    if (!wptr) return 0;
+    const __half *w = (const __half *)wptr;
+#ifdef __HIP_PLATFORM_AMD__
+    if (hipblaslt_gemm_f16(out->ptr,
+                           w,
+                           (const __half *)x_h->ptr,
+                           (uint32_t)out_dim,
+                           (uint32_t)n_tok,
+                           (uint32_t)in_dim,
+                           HIPBLAS_OP_T,
+                           HIP_R_32F,
+                           "f16 projection")) {
+        return 1;
+    }
+#endif
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     x_h->ptr,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out->ptr,
+                                     CUDA_R_32F,
+                                     (int)out_dim,
+                                     CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "f16 half-input matmul");
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(

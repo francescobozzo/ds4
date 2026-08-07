@@ -4034,6 +4034,7 @@ static int glm_rocm_routed_moe_wrap(
                                            expert_mid_dim, out_dim, selected,
                                            weights, n_total_expert, n_expert,
                                            0.0f, x, layer_index, n_tokens, NULL,
+                                           false, NULL,
                                            force_resident);
 }
 

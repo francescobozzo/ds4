@@ -21,6 +21,34 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
     }
 }
 
+__global__ static void rms_norm_plain_f16_kernel(
+        __half *out,
+        const float *x,
+        uint32_t n,
+        uint32_t rows,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    __half *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = __float2half(xr[i] * scale);
+    }
+}
+
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -422,6 +450,19 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4
     rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_plain launch");
 }
+extern "C" int ds4_gpu_rms_norm_plain_rows_f16_tensor(
+        ds4_gpu_tensor *out_h,
+        const ds4_gpu_tensor *x,
+        uint32_t n,
+        uint32_t rows,
+        float eps) {
+    if (!cuda_tensor_has_elems2(out_h, n, rows, sizeof(__half)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
+    if (n == 0u || rows == 0u) return 1;
+    rms_norm_plain_f16_kernel<<<rows, 256>>>(
+            (__half *)out_h->ptr, (const float *)x->ptr, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms_norm_plain_f16 launch");
+}
 extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
     uint64_t weight_bytes = 0;
     if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
@@ -568,28 +609,44 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "attn q_b f16 activation convert launch")) return 0;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasStatus_t st = cublasGemmEx(g_cublas,
-                                     CUBLAS_OP_T,
-                                     CUBLAS_OP_N,
-                                     (int)out_dim,
-                                     (int)n_tok,
-                                     (int)in_dim,
-                                     &alpha,
-                                     w_f16,
-                                     CUDA_R_16F,
-                                     (int)in_dim,
-                                     xh,
-                                     CUDA_R_16F,
-                                     (int)in_dim,
-                                     &beta,
-                                     q_half->ptr,
-                                     CUDA_R_16F,
-                                     (int)out_dim,
-                                     CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT);
-    if (st != CUBLAS_STATUS_SUCCESS) {
+    int gemm_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+    gemm_ok = hipblaslt_gemm_f16(q_half->ptr,
+                                 w_f16,
+                                 xh,
+                                 (uint32_t)out_dim,
+                                 n_tok,
+                                 (uint32_t)in_dim,
+                                 HIPBLAS_OP_T,
+                                 HIP_R_16F,
+                                 "attention q_b");
+#endif
+    cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+    if (!gemm_ok) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        st = cublasGemmEx(g_cublas,
+                          CUBLAS_OP_T,
+                          CUBLAS_OP_N,
+                          (int)out_dim,
+                          (int)n_tok,
+                          (int)in_dim,
+                          &alpha,
+                          w_f16,
+                          CUDA_R_16F,
+                          (int)in_dim,
+                          xh,
+                          CUDA_R_16F,
+                          (int)in_dim,
+                          &beta,
+                          q_half->ptr,
+                          CUDA_R_16F,
+                          (int)out_dim,
+                          CUBLAS_COMPUTE_32F,
+                          CUBLAS_GEMM_DEFAULT);
+        gemm_ok = st == CUBLAS_STATUS_SUCCESS;
+    }
+    if (!gemm_ok) {
         fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " attn q_b f16-out matmul failed: status %d\n", (int)st);
         return 0;
     }

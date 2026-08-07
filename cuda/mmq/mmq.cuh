@@ -116,10 +116,10 @@ static int get_mmq_x_max_host(const int cc) {
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
-    // ds4: optional Step-4 experiment hook. DS4_CUDA_MMQ_X_MAX=N clips the
-    // tile-width selector to N when sweeping for an sm_120-specific
-    // optimum.  Value rounded down to a multiple of 8 (the iteration step
-    // of the mmq_x picker) and capped at base.  Cached on first call.
+    // RDNA 3.5 peaks at x=80 for the IQ2_XXS routed-MoE workload.
+#if defined(GGML_USE_HIP)
+    if (base > 80) base = 80;
+#else
     static int g_override_init = 0;
     static int g_override      = 0;
     if (!g_override_init) {
@@ -134,6 +134,7 @@ static int get_mmq_x_max_host(const int cc) {
         }
     }
     if (g_override > 0 && g_override < base) base = g_override;
+#endif
     return base;
 }
 
@@ -160,8 +161,21 @@ static constexpr __device__ int get_mmq_x_max_device() {
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
+#ifndef DS4_ROCM_WMMA_MMQ_Y
+#define DS4_ROCM_WMMA_MMQ_Y 64
+#endif
+static_assert(DS4_ROCM_WMMA_MMQ_Y == 32 ||
+              DS4_ROCM_WMMA_MMQ_Y == 64 ||
+              DS4_ROCM_WMMA_MMQ_Y == 128,
+              "RDNA WMMA MMQ Y must be 32, 64, or 128");
+
+// Four-wave RDNA WMMA tiles cut the decoded-weight LDS footprint enough to
+// admit more workgroups; MFMA devices retain their eight-wave tile. The
+// compile-time override is only for controlled geometry sweeps.
 static int get_mmq_y_host(const int cc) {
-    return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
+    return GGML_CUDA_CC_IS_AMD(cc) ?
+        (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 :
+         (amd_wmma_available(cc) ? DS4_ROCM_WMMA_MMQ_Y : 128)) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
 
@@ -176,11 +190,11 @@ if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
 
 static constexpr __device__ int get_mmq_y_device() {
 #if defined(GGML_USE_HIP)
-#if defined(RDNA1)
-    return 64;
+#if defined(AMD_WMMA_AVAILABLE) || defined(RDNA1)
+    return DS4_ROCM_WMMA_MMQ_Y;
 #else
     return 128;
-#endif // defined RDNA1
+#endif // defined(AMD_WMMA_AVAILABLE) || defined(RDNA1)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return 128;
@@ -317,7 +331,8 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
-    return amd_mfma_available(cc) ? 8 : 256/warp_size;
+    return amd_mfma_available(cc) ? 8 :
+        (amd_wmma_available(cc) ? DS4_ROCM_WMMA_MMQ_Y/16 : 256/warp_size);
 }
 #else
 static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
@@ -326,11 +341,13 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 #endif // (GGML_USE_HIP)
 
 static constexpr __device__ int mmq_get_nwarps_device() {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE)
     return 8;
+#elif defined(AMD_WMMA_AVAILABLE)
+    return DS4_ROCM_WMMA_MMQ_Y/16;
 #else
     return 256/ggml_cuda_get_physical_warp_size();
-#endif // AMD_MFMA_AVAILABLE
+#endif // defined(AMD_MFMA_AVAILABLE)
 }
 
 // ------------------------------------------------------------
@@ -3638,7 +3655,11 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <
+    ggml_type type,
+    int mmq_x,
+    bool need_check,
+    bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -4167,11 +4188,15 @@ struct mmq_args {
 };
 
 template<ggml_type type>
-static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
+static size_t mmq_get_nbytes_shared(
+        const int mmq_x, const int mmq_y, const int cc,
+        const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
     const int mmq_tile_x_k = mmq_get_mma_tile_x_k(type);
     const size_t nbs_ids = mmq_x*sizeof(int);
-    const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
+    const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc))
+        ? mmq_y*mmq_tile_x_k*sizeof(int)
+        : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
@@ -4187,7 +4212,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
+    const int nbytes_shared = mmq_get_nbytes_shared<type>(
+        mmq_x, mmq_y, cc, warp_size, nwarps);
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
