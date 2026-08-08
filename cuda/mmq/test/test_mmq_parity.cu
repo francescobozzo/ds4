@@ -744,7 +744,8 @@ bool run_moe_pair_generic(
                           const int32_t *, float *, float *,
                           int, int, int, int, int, cudaStream_t),
         int (*single_entry)(const void *, const float *, const int32_t *,
-                            float *, int, int, int, int, int, cudaStream_t)) {
+                            float *, int, int, int, int, int, cudaStream_t),
+        bool test_swiglu_epilogue = false) {
     fprintf(stderr, "=== %s/PAIR  M=%d K=%d ntok=%d nexp=%d nused=%d  seed=%u ===\n",
             tag, M, K, n_tokens, n_experts, n_expert_used, seed);
 
@@ -783,6 +784,7 @@ bool run_moe_pair_generic(
     float * dX = nullptr; int32_t * dIds = nullptr;
     float * dYa_single = nullptr; float * dYb_single = nullptr;
     float * dYa_pair = nullptr;   float * dYb_pair = nullptr;
+    float * dWeights = nullptr;   float * dMid = nullptr;
     cudaMalloc(&dWa, W_a.size() * sizeof(BlockT));
     cudaMalloc(&dWb, W_b.size() * sizeof(BlockT));
     cudaMalloc(&dX,  X.size() * sizeof(float));
@@ -791,6 +793,15 @@ bool run_moe_pair_generic(
     cudaMalloc(&dYb_single, out_count * sizeof(float));
     cudaMalloc(&dYa_pair,   out_count * sizeof(float));
     cudaMalloc(&dYb_pair,   out_count * sizeof(float));
+    std::vector<float> router_weights((size_t)ne_get_rows);
+    if (test_swiglu_epilogue) {
+        for (auto & v : router_weights) v = 0.1f + 0.9f * std::abs(nd(rng));
+        cudaMalloc(&dWeights, router_weights.size() * sizeof(float));
+        cudaMalloc(&dMid, out_count * sizeof(float));
+        cudaMemcpyAsync(dWeights, router_weights.data(),
+                        router_weights.size() * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
+    }
     cudaMemcpyAsync(dWa, W_a.data(), W_a.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dWb, W_b.data(), W_b.size() * sizeof(BlockT), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dX,  X.data(),   X.size()  * sizeof(float),   cudaMemcpyHostToDevice, stream);
@@ -804,30 +815,60 @@ bool run_moe_pair_generic(
     int rc_sb = single_entry(dWb, dX, dIds, dYb_single, M, K, n_tokens, n_experts, n_expert_used, stream);
     int rc_p  = pair_entry  (dWa, dWb, dX, dIds, dYa_pair, dYb_pair,
                              M, K, n_tokens, n_experts, n_expert_used, stream);
-    if (rc_sa != 0 || rc_sb != 0 || rc_p != 0) {
-        fprintf(stderr, "%s pair entry: rc_sa=%d rc_sb=%d rc_p=%d\n", tag, rc_sa, rc_sb, rc_p);
+    const float clamp = 6.0f;
+    int rc_e = 0;
+    if (test_swiglu_epilogue) {
+        rc_e = ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
+            dWa, dWb, dX, dIds, dWeights, dYa_pair, dYb_pair, dMid, nullptr,
+            M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
+    }
+    if (rc_sa != 0 || rc_sb != 0 || rc_p != 0 || rc_e != 0) {
+        fprintf(stderr,
+                "%s pair entry: rc_sa=%d rc_sb=%d rc_p=%d rc_e=%d\n",
+                tag, rc_sa, rc_sb, rc_p, rc_e);
         cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
         cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
+        cudaFree(dWeights); cudaFree(dMid);
         cudaStreamDestroy(stream);
         return false;
     }
 
     std::vector<float> ya_single(out_count, 0.0f), yb_single(out_count, 0.0f);
     std::vector<float> ya_pair  (out_count, 0.0f), yb_pair  (out_count, 0.0f);
+    std::vector<float> mid(out_count, 0.0f);
     cudaMemcpyAsync(ya_single.data(), dYa_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(yb_single.data(), dYb_single, out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(ya_pair.data(),   dYa_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(yb_pair.data(),   dYb_pair,   out_count * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    if (test_swiglu_epilogue) {
+        cudaMemcpyAsync(mid.data(), dMid, out_count * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+    }
     cudaStreamSynchronize(stream);
     cudaFree(dWa); cudaFree(dWb); cudaFree(dX); cudaFree(dIds);
     cudaFree(dYa_single); cudaFree(dYb_single); cudaFree(dYa_pair); cudaFree(dYb_pair);
+    cudaFree(dWeights); cudaFree(dMid);
     cudaStreamDestroy(stream);
 
     // Both pair outputs should be bit-identical to their single counterparts -
     // same kernel, same Q8_1 buffer.  Allow exactly zero abs/rel tolerance.
     const bool ok_a = check_close(ya_pair, ya_single, 0.0f, 0.0f);
     const bool ok_b = check_close(yb_pair, yb_single, 0.0f, 0.0f);
-    const bool ok   = ok_a && ok_b;
+    bool ok_e = true;
+    if (test_swiglu_epilogue) {
+        std::vector<float> expected(out_count);
+        for (size_t i = 0; i < out_count; i++) {
+            float g = ya_single[i];
+            float u = yb_single[i];
+            if (g > clamp) g = clamp;
+            if (u > clamp) u = clamp;
+            if (u < -clamp) u = -clamp;
+            expected[i] = (g / (1.0f + std::exp(-g))) * u *
+                          router_weights[i / (size_t)M];
+        }
+        ok_e = check_close(mid, expected, 1.0e-4f, 1.0e-5f);
+    }
+    const bool ok = ok_a && ok_b && ok_e;
     fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1224,11 +1265,12 @@ int main(int argc, char ** argv) {
         ds4_mmq_iq2_xxs_moe_pair, ds4_mmq_iq2_xxs_moe);
     all_ok &= run_moe_pair_generic<block_iq2_xxs>(
         "IQ2_XXS/TOKEN_BOUND", QK_K_LOCAL,
-        // Keep both control and candidate on the production X=80 template
-        // while still reducing the candidate's routed-column grid by 6x.
-        /*M=*/64, /*K=*/256, /*nt=*/160,
+        // Cover four production ROCm MMQ output tiles. A single M=64 tile
+        // cannot detect epilogue pointer-offset errors in later row tiles.
+        /*M=*/256, /*K=*/256, /*nt=*/160,
         /*ne=*/16, /*nu=*/6, 0xC0FE11, gen_iq2,
-        ds4_mmq_iq2_xxs_moe_pair_token_bound, ds4_mmq_iq2_xxs_moe);
+        ds4_mmq_iq2_xxs_moe_pair_token_bound, ds4_mmq_iq2_xxs_moe,
+        /*test_swiglu_epilogue=*/true);
     all_ok &= run_moe_pair_generic<block_q4_K>(
         "Q4_K", QK_K_LOCAL, /*M=*/256, /*K=*/512, /*nt=*/8,
         /*ne=*/16, /*nu=*/6, 0xC4FE10, gen_q4k,

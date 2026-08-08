@@ -1004,34 +1004,62 @@ static int routed_moe_launch(
         int mmq_hot_mid_f16 = 0;
         half *mmq_mid_h = NULL;
         if (ok && use_mmq_gateup) {
-            ds4_mmq_set_aligned_q81_scratch(down->ptr, (size_t)down->bytes);
-            int rc = ds4_mmq_iq2_xxs_moe_pair_token_bound(
-                gate_w,
-                up_w,
-                (const float *)x->ptr,
-                (const int32_t *)selected_exec->ptr,
-                (float *)gate->ptr,
-                (float *)up->ptr,
-                (int)expert_mid_dim,
-                (int)expert_in_dim,
-                (int)n_tokens,
-                (int)n_total_expert,
-                (int)n_expert,
-                (cudaStream_t)0);
+            const uint64_t mid_count = pair_count64 * expert_mid_dim;
+            uint64_t down_h_bytes = 0;
+            uint64_t mid_h_bytes = 0;
+            if ((out_dim & 1u) == 0u && !g_quality_mode &&
+                cuda_u64_mul3_checked(
+                    pair_count64, out_dim, sizeof(half), &down_h_bytes) &&
+                cuda_u64_mul_checked(
+                    mid_count, sizeof(half), &mid_h_bytes) &&
+                down_h_bytes <= down->bytes &&
+                mid_h_bytes <= down->bytes - down_h_bytes) {
+                mmq_mid_h = (half *)((char *)down->ptr + down_h_bytes);
+            }
+
+            const int use_fused_swiglu =
+                g_rocm_gfx1151 && !g_quality_mode &&
+                !cuda_runtime_config()->graph_dump && mmq_mid_h;
+            int rc = -1;
+            if (use_fused_swiglu) {
+                ds4_mmq_set_aligned_q81_scratch(up->ptr, (size_t)up->bytes);
+                rc = ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
+                    gate_w,
+                    up_w,
+                    (const float *)x->ptr,
+                    (const int32_t *)selected_exec->ptr,
+                    (const float *)weights->ptr,
+                    (float *)gate->ptr,
+                    (float *)down->ptr,
+                    (float *)mid->ptr,
+                    mmq_mid_h,
+                    (int)expert_mid_dim,
+                    (int)expert_in_dim,
+                    (int)n_tokens,
+                    (int)n_total_expert,
+                    (int)n_expert,
+                    clamp,
+                    (cudaStream_t)0);
+            }
+            const int fused_swiglu_done = use_fused_swiglu && rc == 0;
+            if (rc != 0) {
+                ds4_mmq_set_aligned_q81_scratch(down->ptr, (size_t)down->bytes);
+                rc = ds4_mmq_iq2_xxs_moe_pair_token_bound(
+                    gate_w,
+                    up_w,
+                    (const float *)x->ptr,
+                    (const int32_t *)selected_exec->ptr,
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (int)expert_mid_dim,
+                    (int)expert_in_dim,
+                    (int)n_tokens,
+                    (int)n_total_expert,
+                    (int)n_expert,
+                    (cudaStream_t)0);
+            }
             ds4_mmq_set_aligned_q81_scratch(NULL, 0);
-            if (rc == 0) {
-                const uint64_t mid_count = pair_count64 * expert_mid_dim;
-                uint64_t down_h_bytes = 0;
-                uint64_t mid_h_bytes = 0;
-                if ((out_dim & 1u) == 0u && !g_quality_mode &&
-                    cuda_u64_mul3_checked(
-                        pair_count64, out_dim, sizeof(half), &down_h_bytes) &&
-                    cuda_u64_mul_checked(
-                        mid_count, sizeof(half), &mid_h_bytes) &&
-                    down_h_bytes <= down->bytes &&
-                    mid_h_bytes <= down->bytes - down_h_bytes) {
-                    mmq_mid_h = (half *)((char *)down->ptr + down_h_bytes);
-                }
+            if (rc == 0 && !fused_swiglu_done) {
                 moe_mmq_swiglu_weighted_clamp_kernel<<<
                         (uint32_t)((mid_count + 255u) / 256u), 256>>>(
                         (float *)mid->ptr,
@@ -1045,8 +1073,8 @@ static int routed_moe_launch(
                         clamp);
                 rc = cuda_ok(cudaGetLastError(),
                              "routed_moe HIP MMQ swiglu launch") ? 0 : -1;
-                if (rc == 0 && mmq_mid_h) mmq_hot_mid_f16 = 1;
             }
+            if (rc == 0 && mmq_mid_h) mmq_hot_mid_f16 = 1;
             if (rc == 0) {
                 mmq_gateup_done = 1;
                 static int logged = 0;
@@ -1054,7 +1082,8 @@ static int routed_moe_launch(
                     logged = 1;
                     fprintf(stderr,
                             DS4_GPU_LOG_PREFIX
-                            "routed MoE using HIP MMQ gate/up with native Q2 down\n");
+                            "routed MoE using HIP MMQ gate/up%s with native Q2 down\n",
+                            fused_swiglu_done ? " fused SwiGLU" : "");
                 }
             } else {
                 fprintf(stderr,

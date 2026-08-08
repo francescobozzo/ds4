@@ -5856,6 +5856,7 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    ds4_mmq_cleanup();
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__

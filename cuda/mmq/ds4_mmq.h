@@ -35,6 +35,7 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+void ds4_mmq_cleanup(void);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns
@@ -319,6 +320,28 @@ int ds4_mmq_iq2_xxs_moe_pair_token_bound(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
+    cudaStream_t    stream);
+
+// Non-stream-K variant for ROCm prefill. The up result stays in the MMQ
+// write-back register and is combined with the materialized gate, router
+// weight, clamp, and SwiGLU directly into pair-major FP32/FP16 mid outputs.
+// discard must be a valid, disjoint device pointer but is not written.
+int ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
+    const void    * W_gate,
+    const void    * W_up,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * discard,
+    float         * mid_f32,
+    void          * mid_f16,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
     cudaStream_t    stream);
 
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the

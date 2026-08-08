@@ -29,7 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cstring>
+#include <mutex>
 
 #if defined(__has_include)
 #if __has_include(<nvtx3/nvToolsExt.h>)
@@ -116,6 +116,52 @@ static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
+
+#if defined(GGML_USE_HIP)
+struct ds4_hip_persistent_scratch {
+    void *ptr = nullptr;
+    size_t bytes = 0;
+    std::mutex mutex;
+};
+
+static ds4_hip_persistent_scratch g_hip_dense_q81_scratch;
+static ds4_hip_persistent_scratch g_hip_pair_map_scratch;
+
+static void *ds4_hip_persistent_scratch_reserve_locked(
+        ds4_hip_persistent_scratch *scratch,
+        size_t bytes,
+        size_t granularity,
+        cudaStream_t stream,
+        const char *tag) {
+    if (!scratch || bytes == 0 || stream != (cudaStream_t)0) return nullptr;
+    if (scratch->ptr && scratch->bytes >= bytes) return scratch->ptr;
+    if (granularity == 0 || bytes > SIZE_MAX - (granularity - 1u)) {
+        return nullptr;
+    }
+
+    const size_t reserve =
+        ((bytes + granularity - 1u) / granularity) * granularity;
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: scratch resize synchronization failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    void *next = nullptr;
+    err = cudaMalloc(&next, reserve);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: persistent scratch allocation of %zu bytes failed: %s\n",
+                tag, reserve, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    if (scratch->ptr) (void)cudaFree(scratch->ptr);
+    scratch->ptr = next;
+    scratch->bytes = reserve;
+    return scratch->ptr;
+}
+#endif
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -319,6 +365,36 @@ extern "C" int ds4_mmq_init(int device) {
         }
     }
     return 0;
+}
+
+extern "C" void ds4_mmq_cleanup(void) {
+#if defined(GGML_USE_HIP)
+    (void)cudaDeviceSynchronize();
+    {
+        std::lock_guard<std::mutex> lock(g_hip_dense_q81_scratch.mutex);
+        if (g_hip_dense_q81_scratch.ptr) {
+            (void)cudaFree(g_hip_dense_q81_scratch.ptr);
+            g_hip_dense_q81_scratch.ptr = nullptr;
+            g_hip_dense_q81_scratch.bytes = 0;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_hip_pair_map_scratch.mutex);
+        if (g_hip_pair_map_scratch.ptr) {
+            (void)cudaFree(g_hip_pair_map_scratch.ptr);
+            g_hip_pair_map_scratch.ptr = nullptr;
+            g_hip_pair_map_scratch.bytes = 0;
+        }
+    }
+#endif
+    if (g_q81_scratch_ptr) {
+        (void)cudaFree(g_q81_scratch_ptr);
+        g_q81_scratch_ptr = nullptr;
+        g_q81_scratch_bytes = 0;
+        g_q81_scratch_enabled = false;
+    }
+    g_aligned_q81_scratch_ptr = nullptr;
+    g_aligned_q81_scratch_bytes = 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -526,7 +602,25 @@ int ds4_mmq_dense_impl(
             y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    char *src1_q8_1 = nullptr;
+#if defined(GGML_USE_HIP)
+    std::unique_lock<std::mutex> dense_scratch_lock;
+    if (stream == (cudaStream_t)0) {
+        dense_scratch_lock =
+            std::unique_lock<std::mutex>(g_hip_dense_q81_scratch.mutex);
+        src1_q8_1 = (char *)ds4_hip_persistent_scratch_reserve_locked(
+            &g_hip_dense_q81_scratch,
+            nbytes_src1_q8_1,
+            64u * 1024u * 1024u,
+            stream,
+            tag);
+    }
+#endif
+    if (!src1_q8_1) {
+        src1_q8_1 = src1_q8_1_pool.alloc(
+            ctx->pool(), nbytes_src1_q8_1);
+    }
 
     // S1.1a fix: the mmq Y (activation) buffer is over-allocated for the kernel's
     // tail-tile reads (the +mmq_x_max blocks above), and ne11 columns may not fill
@@ -540,17 +634,17 @@ int ds4_mmq_dense_impl(
     // The tail's dot-products are masked out by write_back, so only their
     // non-determinism matters; zero the buffer so the tail is a deterministic zero
     // (a zero q8_1 block contributes 0 to the dot product).
-    ybuf_memset(src1_q8_1.get(), nbytes_src1_q8_1, stream);
+    ybuf_memset(src1_q8_1, nbytes_src1_q8_1, stream);
 
     if (use_native_fp4) {
         quantize_mmq_fp4_cuda(
-            X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+            X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
     } else {
         quantize_mmq_q8_1_cuda(
-            X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
+            X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
@@ -583,7 +677,7 @@ int ds4_mmq_dense_impl(
     const mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1.get(),
+        /*y=*/(const int *)src1_q8_1,
         /*ids_dst=*/nullptr,
         /*expert_bounds=*/nullptr,
         /*dst=*/out_f32,
@@ -1124,6 +1218,13 @@ struct ds4_mmq_fused_down {
     size_t        input_q8_ext_bytes;
 };
 
+struct ds4_mmq_swiglu_epilogue {
+    const float * router_weights;
+    float       * mid_f32;
+    half        * mid_f16;
+    float         clamp;
+};
+
 static bool ds4_mmq_take_scratch(
         void *base, size_t capacity, size_t *offset,
         size_t bytes, size_t alignment, void **result) {
@@ -1205,12 +1306,14 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ds4_mmq_fused_down *fused_down = nullptr,
+        const ds4_mmq_swiglu_epilogue *swiglu_epilogue = nullptr) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
     if (!W_a || !W_b || !X_f32 || !ids ||
-        (!direct_gateup_q8 && (!out_a || !out_b))) {
+        (!direct_gateup_q8 &&
+         (!out_a || (!out_b && !swiglu_epilogue)))) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -1239,6 +1342,13 @@ int ds4_mmq_moe_pair_impl(
            !fused_down->work_scratch || fused_down->work_scratch_bytes == 0)) ||
          !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
         fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
+        return -1;
+    }
+    if (swiglu_epilogue &&
+        (type != GGML_TYPE_IQ2_XXS || fused_down ||
+         !swiglu_epilogue->router_weights ||
+         !swiglu_epilogue->mid_f32)) {
+        fprintf(stderr, "%s: invalid weighted SwiGLU epilogue\n", tag);
         return -1;
     }
 
@@ -1278,6 +1388,9 @@ int ds4_mmq_moe_pair_impl(
     int32_t *ids_src1 = nullptr;
     int32_t *ids_dst = nullptr;
     int32_t *expert_bounds = nullptr;
+#if defined(GGML_USE_HIP)
+    std::unique_lock<std::mutex> pair_map_scratch_lock;
+#endif
     void *direct_work = nullptr;
     size_t direct_work_bytes = 0;
 
@@ -1339,9 +1452,34 @@ int ds4_mmq_moe_pair_impl(
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
     } else {
-        ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
-        ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
-        expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+#if defined(GGML_USE_HIP)
+        if (stream == (cudaStream_t)0 &&
+            (uint64_t)ne_get_rows <=
+                (SIZE_MAX / sizeof(int32_t) - (size_t)n_experts - 1u) / 2u) {
+            pair_map_scratch_lock =
+                std::unique_lock<std::mutex>(g_hip_pair_map_scratch.mutex);
+            const size_t map_elems =
+                2u * (size_t)ne_get_rows + (size_t)n_experts + 1u;
+            int32_t *map = (int32_t *)
+                ds4_hip_persistent_scratch_reserve_locked(
+                    &g_hip_pair_map_scratch,
+                    map_elems * sizeof(int32_t),
+                    1024u * 1024u,
+                    stream,
+                    tag);
+            if (map) {
+                ids_src1 = map;
+                ids_dst = map + ne_get_rows;
+                expert_bounds = ids_dst + ne_get_rows;
+            }
+        }
+#endif
+        if (!ids_src1) {
+            ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+            ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+            expert_bounds =
+                expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+        }
     }
 
     const int si1  = n_expert_used;
@@ -1381,6 +1519,9 @@ int ds4_mmq_moe_pair_impl(
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    if (swiglu_epilogue && use_stream_k) {
+        return -13;
+    }
     /* True top-k assignments cannot select one expert twice for a token, so
      * no expert bucket can exceed n_tokens rows. Keep the conservative
      * gathered-row bound for generic MMQ callers, including DSpark/MTP. */
@@ -1584,11 +1725,14 @@ int ds4_mmq_moe_pair_impl(
 
     if (out_memset_enabled()) {
         cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-        cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        if (!swiglu_epilogue) {
+            cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        }
     }
 
     bool gate_up_done = false;
-    if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
+    if (!swiglu_epilogue &&
+        type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
         static int d2r_iq2_avail_cc = -1;
@@ -1664,6 +1808,13 @@ int ds4_mmq_moe_pair_impl(
     args.x     = (const char *)W_b;
     args.dst   = out_b;
     args.x_soa = xb_soa;
+    if (swiglu_epilogue) {
+        args.epilogue_gate = out_a;
+        args.epilogue_weights = swiglu_epilogue->router_weights;
+        args.epilogue_mid = swiglu_epilogue->mid_f32;
+        args.epilogue_mid_h = swiglu_epilogue->mid_f16;
+        args.epilogue_clamp = swiglu_epilogue->clamp;
+    }
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_up",
@@ -1801,7 +1952,7 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
+    if (sanitize_out && !swiglu_epilogue) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
@@ -1891,6 +2042,25 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_token_bound(
         "ds4_mmq_iq2_xxs_moe_pair_token_bound",
         W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
+        const void * W_gate, const void * W_up,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * discard, float * mid_f32, void * mid_f16,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const ds4_mmq_swiglu_epilogue epilogue = {
+        router_weights,
+        mid_f32,
+        (half *)mid_f16,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, false, true>(
+        "ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu",
+        W_gate, W_up, X, ids, gate, discard,
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        nullptr, nullptr, 0, /*sanitize_out=*/false, nullptr, &epilogue);
 }
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up
