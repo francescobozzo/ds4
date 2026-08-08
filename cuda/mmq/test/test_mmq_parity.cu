@@ -439,6 +439,52 @@ bool run_q8_0(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     return ok;
 }
 
+bool run_q8_0_nonfinite_sanitize() {
+    constexpr int M = 64;
+    constexpr int N = 4;
+    constexpr int K = 256;
+    fprintf(stderr, "=== Q8_0 non-finite output sanitize ===\n");
+
+    std::vector<cpu_block_q8_0> W((size_t)M * K / QK8_0);
+    for (auto & block : W) {
+        block.d = float_to_fp16(INFINITY);
+        std::fill(block.qs, block.qs + QK8_0, (int8_t)1);
+    }
+    std::vector<float> X((size_t)N * K, 1.0f);
+    std::vector<float> Y((size_t)M * N, -1.0f);
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    void * dW = nullptr;
+    float * dX = nullptr;
+    float * dY = nullptr;
+    cudaMalloc(&dW, W.size() * sizeof(cpu_block_q8_0));
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dY, Y.size() * sizeof(float));
+    cudaMemcpyAsync(dW, W.data(), W.size() * sizeof(cpu_block_q8_0),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    const int rc = ds4_mmq_q8_0_dense(dW, dX, dY, M, N, K, stream);
+    if (rc == 0) {
+        cudaMemcpyAsync(Y.data(), dY, Y.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+    }
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dY);
+    cudaStreamDestroy(stream);
+
+    const bool ok = rc == 0 &&
+        std::all_of(Y.begin(), Y.end(), [](float value) {
+            return value == 0.0f && std::isfinite(value);
+        });
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 bool run_q2_K(int M, int N, int K, uint32_t seed, float abs_scale = 0.05f) {
     fprintf(stderr, "=== Q2_K   M=%d N=%d K=%d  seed=%u ===\n", M, N, K, seed);
     std::mt19937 rng(seed);
@@ -1186,6 +1232,7 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0(/*M=*/128,  /*N=*/8,   /*K=*/512,  0xDEADBEE);
     all_ok &= run_q8_0(/*M=*/64,   /*N=*/1,   /*K=*/256,  0x12345);
     all_ok &= run_q8_0(/*M=*/1024, /*N=*/16,  /*K=*/4096, 0xBAD7E11);
+    all_ok &= run_q8_0_nonfinite_sanitize();
 
     // Q2_K - V4 Flash ffn_down_exps per-expert shape is (K=2048, N=4096).
     all_ok &= run_q2_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0x02C0FFEE);

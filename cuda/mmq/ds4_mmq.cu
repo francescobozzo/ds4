@@ -674,7 +674,7 @@ int ds4_mmq_dense_impl(
         cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
-    const mmq_args args = {
+    mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1,
@@ -690,6 +690,13 @@ int ds4_mmq_dense_impl(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne11,
     };
+#if defined(GGML_USE_HIP)
+    const bool inline_sanitize =
+        type == GGML_TYPE_Q8_0 && !use_stream_k;
+    args.sanitize_output = inline_sanitize;
+#else
+    const bool inline_sanitize = false;
+#endif
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
@@ -698,7 +705,9 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    if (!inline_sanitize) {
+        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
+    }
     return 0;
 }
 
@@ -790,7 +799,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
-    const mmq_args args = {
+    mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/GGML_TYPE_Q8_0,
         /*y=*/(const int *)Y_q8_mmq,
@@ -806,13 +815,21 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/(int64_t)N,
     };
+#if defined(GGML_USE_HIP)
+    const bool inline_sanitize = !use_stream_k;
+    args.sanitize_output = inline_sanitize;
+#else
+    const bool inline_sanitize = false;
+#endif
     mul_mat_q_case<GGML_TYPE_Q8_0>(*ctx, args, stream);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
+    if (!inline_sanitize) {
+        ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
+    }
     return 0;
 }
 

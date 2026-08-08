@@ -6,6 +6,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <type_traits>
 
 using namespace ggml_cuda_mma;
 
@@ -3396,7 +3397,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-template<int mmq_x, int mmq_y, bool need_check>
+template<int mmq_x, int mmq_y, bool need_check, bool sanitize_output>
 static __device__ __forceinline__ void mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max,
@@ -3426,6 +3427,9 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
             const int dst_i = dst_j*stride + i;
             float u = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
             if (!epilogue_mid) {
+                if constexpr (sanitize_output) {
+                    if (!isfinite(u)) u = 0.0f;
+                }
                 dst[dst_i] = u;
                 continue;
             }
@@ -3445,7 +3449,7 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
     }
 }
 
-template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
+template<ggml_type type, int mmq_x, int mmq_y, bool need_check, bool sanitize_output>
 static __device__ __forceinline__ void mmq_write_back_mma(
         const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max,
@@ -3495,6 +3499,9 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                 const int dst_i = dst_j*stride + i;
                 float u = sum[(j0/tile_C::J + n)*tile_C::ne + l];
                 if (!epilogue_mid) {
+                    if constexpr (sanitize_output) {
+                        if (!isfinite(u)) u = 0.0f;
+                    }
                     dst[dst_i] = u;
                     continue;
                 }
@@ -3702,7 +3709,8 @@ template <
     ggml_type type,
     int mmq_x,
     bool need_check,
-    bool fixup>
+    bool fixup,
+    bool sanitize_output>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3725,10 +3733,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
-    constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check>;
+    constexpr mmq_write_back_t write_back = mmq_write_back_mma<type, mmq_x, mmq_y, need_check, sanitize_output>;
 #else
     constexpr vec_dot_mmq_t    vec_dot    = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
-    constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, need_check>;
+    constexpr mmq_write_back_t write_back = mmq_write_back_dp4a<mmq_x, mmq_y, need_check, sanitize_output>;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -3813,7 +3821,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check>
+template <ggml_type type, int mmq_x, bool need_check, bool sanitize_output>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3923,7 +3931,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
@@ -4014,7 +4022,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
              epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -4085,7 +4093,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
          epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -4253,6 +4261,9 @@ struct mmq_args {
     float * epilogue_mid;
     half * epilogue_mid_h;
     float epilogue_clamp;
+    // Dense Q8 can fold its non-finite contract into final MMQ write-back.
+    // This is false for routed and stream-K paths.
+    bool sanitize_output;
 };
 
 template<ggml_type type>
@@ -4283,8 +4294,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nbytes_shared = mmq_get_nbytes_shared<type>(
         mmq_x, mmq_y, cc, warp_size, nwarps);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, false>), nbytes_shared);
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x, false, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, mmq_x,  true, true>), nbytes_shared);
+    }
 
     const int nty  = (args.nrows_x   + mmq_y - 1) / mmq_y;
     const int ntx  = (args.ncols_max + mmq_x - 1) / mmq_x;
@@ -4306,30 +4321,50 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(!args.epilogue_mid || !args.use_stream_k);
 
     if (!args.use_stream_k) {
-        if (args.nrows_x % mmq_y == 0) {
-            constexpr bool need_check = false;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.x_soa, args.soa_blocks,
-                 args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
-                 args.epilogue_mid_h, args.epilogue_clamp);
+        const auto launch_tiled = [&](auto sanitize_tag) {
+            constexpr bool sanitize_output = decltype(sanitize_tag)::value;
+            if (args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                mul_mat_q<type, mmq_x, need_check, sanitize_output>
+                    <<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                        blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd, nchannels_y_fd,
+                        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                        sample_ratio_fd, nsamples_y_fd, args.stride_sample_x,
+                        args.stride_sample_y, args.stride_sample_dst, ntx_fd,
+                        args.x_soa, args.soa_blocks, args.epilogue_gate,
+                        args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
+                        args.epilogue_clamp);
+            } else {
+                constexpr bool need_check = true;
+                mul_mat_q<type, mmq_x, need_check, sanitize_output>
+                    <<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                        blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd, nchannels_y_fd,
+                        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                        sample_ratio_fd, nsamples_y_fd, args.stride_sample_x,
+                        args.stride_sample_y, args.stride_sample_dst, ntx_fd,
+                        args.x_soa, args.soa_blocks, args.epilogue_gate,
+                        args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
+                        args.epilogue_clamp);
+            }
+        };
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            if (args.sanitize_output) {
+                launch_tiled(std::true_type{});
+            } else {
+                launch_tiled(std::false_type{});
+            }
         } else {
-            constexpr bool need_check = true;
-            mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
-                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
-                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.x_soa, args.soa_blocks,
-                 args.epilogue_gate, args.epilogue_weights, args.epilogue_mid,
-                 args.epilogue_mid_h, args.epilogue_clamp);
+            GGML_ASSERT(!args.sanitize_output);
+            launch_tiled(std::false_type{});
         }
         return;
     }
 
+    GGML_ASSERT(!args.sanitize_output);
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     const int ntiles_dst = ntx * nty * ntzw;
@@ -4355,7 +4390,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (args.nrows_x % mmq_y == 0) {
         constexpr bool need_check = false;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -4375,7 +4410,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              ntx_fd);
     } else {
         constexpr bool need_check = true;
-        mul_mat_q<type, mmq_x, need_check><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, mmq_x, need_check, false><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
