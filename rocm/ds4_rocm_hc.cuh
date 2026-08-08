@@ -366,9 +366,11 @@ __global__ static void hc_split_weighted_sum_fused_kernel(
     }
 }
 
+template <bool WRITE_F16>
 __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         float *out,
         float *norm_out,
+        __half *norm_out_h,
         float *split,
         const float *mix,
         const float *residual_hc,
@@ -409,6 +411,11 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
-        norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
+        const uint64_t i = (uint64_t)t * n_embd + col;
+        const float norm_v = v * norm_scale * norm_w[col];
+        norm_out[i] = norm_v;
+        if constexpr (WRITE_F16) {
+            norm_out_h[i] = __float2half(((volatile float *)norm_out)[i]);
+        }
     }
 }

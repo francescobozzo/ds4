@@ -2720,6 +2720,30 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         uint32_t              out_dim,
         float                 eps);
 
+
+/* ROCm prefill variant that also emits the normalized row as F16 for an
+ * immediately following F16 projection. Returns 0 when unavailable. */
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *norm_out_h,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
+#endif
+
+
 /* Batched HC RMSNorm followed by its narrow F16 mixer projection. On the
  * tuned Metal path, scale_scratch stores one float per row instead of the
  * full normalized HC tensor; other shapes retain the established fallback. */

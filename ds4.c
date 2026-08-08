@@ -30159,6 +30159,8 @@ static bool metal_graph_encode_layer_ffn_batch(
             metal_graph_batch_ffn_cur(g), 0, (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float));
     ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
             metal_graph_batch_next_hc(g), 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
+    ds4_gpu_tensor *ffn_norm_h_view = NULL;
+    bool ffn_norm_f16 = false;
     bool ok = hc_mix_view && hc_split_view && ffn_cur_view && next_hc_view;
     const bool fuse_hc_norm = n_tokens > 1 &&
                               DS4_N_HC == 4 &&
@@ -30189,21 +30191,63 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                             DS4_N_EMBD,
                                                             DS4_N_HC) != 0;
     } else if (fuse_hc_norm) {
-        if (ok) ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(ffn_cur_view,
-                                                                 metal_graph_batch_ffn_norm(g),
-                                                                 hc_split_view,
-                                                                 hc_mix_view,
-                                                                 metal_graph_batch_after_attn_hc(g),
-                                                                 model->map,
-                                                                 model->size,
-                                                                 layer->hc_ffn_scale->abs_offset,
-                                                                 layer->hc_ffn_base->abs_offset,
-                                                                 layer->ffn_norm->abs_offset,
-                                                                 DS4_N_EMBD,
-                                                                 DS4_N_HC,
-                                                                 DS4_N_HC_SINKHORN_ITER,
-                                                                 DS4_HC_EPS,
-                                                                 DS4_RMS_EPS) != 0;
+#ifdef DS4_ROCM_BUILD
+        if (ok && !layer_stage_profile && n_tokens >= 128u &&
+            layer->ffn_gate_inp &&
+            layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+            layer->ffn_gate_inp->dim[0] == DS4_N_EMBD &&
+            layer->ffn_gate_inp->dim[1] == DS4_N_EXPERT) {
+            ffn_norm_h_view = ds4_gpu_tensor_view(
+                    metal_graph_batch_flat_hc(g),
+                    0,
+                    (uint64_t)n_tokens * DS4_N_EMBD * sizeof(uint16_t));
+            if (!ffn_norm_h_view) {
+                ok = false;
+            } else {
+                const int f16_norm =
+                    ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
+                            ffn_cur_view,
+                            metal_graph_batch_ffn_norm(g),
+                            ffn_norm_h_view,
+                            hc_split_view,
+                            hc_mix_view,
+                            metal_graph_batch_after_attn_hc(g),
+                            model->map,
+                            model->size,
+                            layer->hc_ffn_scale->abs_offset,
+                            layer->hc_ffn_base->abs_offset,
+                            layer->ffn_norm->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_N_HC,
+                            DS4_N_HC_SINKHORN_ITER,
+                            DS4_HC_EPS,
+                            DS4_RMS_EPS);
+                if (f16_norm < 0) {
+                    ok = false;
+                } else {
+                    ffn_norm_f16 = f16_norm > 0;
+                }
+            }
+        }
+#endif
+        if (ok && !ffn_norm_f16) {
+            ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                     ffn_cur_view,
+                     metal_graph_batch_ffn_norm(g),
+                     hc_split_view,
+                     hc_mix_view,
+                     metal_graph_batch_after_attn_hc(g),
+                     model->map,
+                     model->size,
+                     layer->hc_ffn_scale->abs_offset,
+                     layer->hc_ffn_base->abs_offset,
+                     layer->ffn_norm->abs_offset,
+                     DS4_N_EMBD,
+                     DS4_N_HC,
+                     DS4_N_HC_SINKHORN_ITER,
+                     DS4_HC_EPS,
+                     DS4_RMS_EPS) != 0;
+        }
     } else {
         if (ok) ok = ds4_gpu_hc_split_weighted_sum_tensor(ffn_cur_view,
                                                             hc_split_view,
@@ -30238,13 +30282,26 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
-    if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
-                                                 model,
-                                                 layer->ffn_gate_inp,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
-                                                 metal_graph_batch_ffn_norm(g),
-                                                 n_tokens);
+    if (ok && ffn_norm_f16) {
+        ok = ds4_gpu_matmul_f16_f16_input_tensor(
+                 metal_graph_batch_router_logits(g),
+                 model->map,
+                 model->size,
+                 layer->ffn_gate_inp->abs_offset,
+                 DS4_N_EMBD,
+                 DS4_N_EXPERT,
+                 ffn_norm_h_view,
+                 n_tokens) != 0;
+    } else if (ok) {
+        ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
+                                               model,
+                                               layer->ffn_gate_inp,
+                                               DS4_N_EMBD,
+                                               DS4_N_EXPERT,
+                                               metal_graph_batch_ffn_norm(g),
+                                               n_tokens);
+    }
+    ds4_gpu_tensor_free(ffn_norm_h_view);
 
     ds4_gpu_tensor *router_tokens = NULL;
     if (ok) {
