@@ -2076,7 +2076,7 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
     float total = 0.0f;
-    #pragma unroll
+    #pragma unroll 2
     for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
         if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
