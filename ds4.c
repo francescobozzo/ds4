@@ -28740,6 +28740,7 @@ static bool metal_graph_encode_layer_attention_batch(
             ok = false;
         }
         if (ok) {
+#if defined(__APPLE__)
             ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                              model->map,
                                              model->size,
@@ -28764,6 +28765,24 @@ static bool metal_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: gpu layer %u attention compressor score projection failed\n", il);
                 }
             }
+#else
+            ok = ds4_gpu_matmul_f16_pair_tensor(
+                     metal_graph_batch_comp_kv(g),
+                     metal_graph_batch_comp_sc(g),
+                     model->map,
+                     model->size,
+                     layer->attn_compressor_kv->abs_offset,
+                     layer->attn_compressor_gate->abs_offset,
+                     DS4_N_EMBD,
+                     comp_width,
+                     metal_graph_batch_attn_norm(g),
+                     n_tokens) != 0;
+            if (!ok) {
+                fprintf(stderr,
+                        "ds4: gpu layer %u attention compressor paired projection failed\n",
+                        il);
+            }
+#endif
         }
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
                                               metal_graph_batch_comp_kv(g),
@@ -29077,6 +29096,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
+#if defined(__APPLE__)
                 ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                                  model->map,
                                                  model->size,
@@ -29093,6 +29113,19 @@ static bool metal_graph_encode_layer_attention_batch(
                                                          index_width,
                                                          metal_graph_batch_attn_norm(g),
                                                          n_tokens) != 0;
+#else
+                ok = ds4_gpu_matmul_f16_pair_tensor(
+                         metal_graph_batch_comp_kv(g),
+                         metal_graph_batch_comp_sc(g),
+                         model->map,
+                         model->size,
+                         layer->indexer_compressor_kv->abs_offset,
+                         layer->indexer_compressor_gate->abs_offset,
+                         DS4_N_EMBD,
+                         index_width,
+                         metal_graph_batch_attn_norm(g),
+                         n_tokens) != 0;
+#endif
             }
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   metal_graph_batch_comp_kv(g),

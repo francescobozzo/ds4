@@ -1023,11 +1023,41 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
     }
+    if (n_tok >= 128u && g_cublas_ready) {
+        uint64_t x_bytes = 0, xh_bytes = 0;
+        if (cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) &&
+            cuda_u64_mul3_checked(n_tok, in_dim, sizeof(__half), &xh_bytes) &&
+            x->bytes >= x_bytes) {
+            __half *xh = (__half *)cuda_tmp_alloc(
+                xh_bytes, "f16 pair gemm activations");
+            if (xh) {
+                const uint64_t xh_count = n_tok * in_dim;
+                f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
+                    xh, (const float *)x->ptr, xh_count);
+                if (cuda_ok(cudaGetLastError(),
+                            "f16 pair activation convert launch")) {
+                    ds4_gpu_tensor x_h = {};
+                    x_h.ptr = xh;
+                    x_h.bytes = xh_bytes;
+                    if (ds4_gpu_matmul_f16_f16_input_tensor(
+                            out0, model_map, model_size, weight0_offset,
+                            in_dim, out_dim, &x_h, n_tok) &&
+                        ds4_gpu_matmul_f16_f16_input_tensor(
+                            out1, model_map, model_size, weight1_offset,
+                            in_dim, out_dim, &x_h, n_tok)) {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
     if (n_tok != 1) {
-        return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
-                                           in_dim, out_dim, x, n_tok) &&
-               ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
-                                           in_dim, out_dim, x, n_tok);
+        return ds4_gpu_matmul_f16_tensor(
+                   out0, model_map, model_size, weight0_offset,
+                   in_dim, out_dim, x, n_tok) &&
+               ds4_gpu_matmul_f16_tensor(
+                   out1, model_map, model_size, weight1_offset,
+                   in_dim, out_dim, x, n_tok);
     }
     uint64_t weight_bytes = 0;
     if (weight0_offset > model_size || weight1_offset > model_size ||
