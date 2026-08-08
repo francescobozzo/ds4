@@ -5824,6 +5824,9 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+extern "C" int ds4_gpu_rocm_prefill_f16_kv_mirror_supported(void) {
+    return g_rocm_gfx1151 && !g_quality_mode;
+}
 
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;

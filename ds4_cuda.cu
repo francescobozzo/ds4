@@ -16571,7 +16571,9 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16) {
+    (void)comp_mirror_f16;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || ratio == 0 || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -16687,7 +16689,9 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16) {
+    (void)comp_mirror_f16;
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||

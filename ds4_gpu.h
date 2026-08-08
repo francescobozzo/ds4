@@ -1151,6 +1151,17 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dsv4_fp8_kv_quantize_mirror_f16_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *mirror_f16,
+        uint32_t        n_tok,
+        uint32_t        head_dim,
+        uint32_t        n_rot);
+
+int ds4_gpu_rocm_prefill_f16_kv_mirror_supported(void);
+#endif
+
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
@@ -1868,7 +1879,8 @@ int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16);
 
 int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         ds4_gpu_tensor       *comp_cache,
@@ -1894,7 +1906,8 @@ int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps);
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16);
 
 int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         ds4_gpu_tensor       *state_kv,

@@ -84,13 +84,13 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-template <bool INDEXED>
+template <bool INDEXED, bool COMP_F16>
 __global__ __launch_bounds__(1024, 1) static void attention_mixed_heads32_wmma_kernel(
         float *heads,
         const float *sinks,
         const float *q,
         const float *raw_kv,
-        const float *comp_kv,
+        const void *comp_kv,
         const int32_t *topk,
         float *score_cache,
         uint32_t score_stride,
@@ -226,17 +226,22 @@ __global__ __launch_bounds__(1024, 1) static void attention_mixed_heads32_wmma_k
                 half v = __float2half(0.0f);
                 if (rr < nr) {
                     const uint32_t sr = row0 + rr;
-                    const float *src;
                     if (sr < raw_count) {
-                        src = raw_kv + (uint64_t)raw_rows[sr] * DIM;
+                        v = __float2half(
+                            raw_kv[(uint64_t)raw_rows[sr] * DIM + d]);
                     } else {
                         uint32_t comp_row = sr - raw_count;
                         if constexpr (INDEXED) {
                             comp_row = comp_rows[comp_row];
                         }
-                        src = comp_kv + (uint64_t)comp_row * DIM;
+                        if constexpr (COMP_F16) {
+                            v = ((const half *)comp_kv)[
+                                (uint64_t)comp_row * DIM + d];
+                        } else {
+                            v = __float2half(((const float *)comp_kv)[
+                                (uint64_t)comp_row * DIM + d]);
+                        }
                     }
-                    v = __float2half(src[d]);
                 }
                 kv_half[rr * LDS_DIM + d] = v;
             }
