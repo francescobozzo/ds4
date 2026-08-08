@@ -1393,7 +1393,7 @@ static void test_metal_compressor_ape_add_exact_case(
             ref_comp, ref_state_kv, ref_state_score, kv, sc,
             model_raw, model_bytes, 0, ape_type, norm_offset, 0,
             head_dim, ratio, pos0, n_tokens, 0, 0, false,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
 
         if (test_pack_fusion) {
             // Overwrite every persistent pack cell with qNaN payloads through
@@ -1419,7 +1419,7 @@ static void test_metal_compressor_ape_add_exact_case(
                 fused_comp, fused_state_kv, fused_state_score, kv, sc,
                 model_raw, model_bytes, 0, ape_type, norm_offset, 0,
                 head_dim, 0, n_comp * ratio, 0, 0, false,
-                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
             TEST_ASSERT(ds4_gpu_tensor_write(
                             kv, 0, kv_host, input_bytes) != 0);
             TEST_ASSERT(ds4_gpu_tensor_write(
@@ -1438,7 +1438,7 @@ static void test_metal_compressor_ape_add_exact_case(
             fused_comp, fused_state_kv, fused_state_score, kv, sc,
             model_raw, model_bytes, 0, ape_type, norm_offset, 0,
             head_dim, ratio, pos0, n_tokens, 0, 0, false,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
 
         if (test_pack_fusion) {
             TEST_ASSERT(ds4_gpu_tensor_read(
@@ -1655,7 +1655,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
             ref_comp, ref_state_kv, ref_state_score, kv, sc,
             model_raw, model_bytes, 0, 1, norm_offset, 0,
             head_dim, 0, n_tokens, 0, 0, false,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
 
         // Poison every persistent pack cell through the legacy full-fill path
         // so a missing candidate write cannot inherit the reference value.
@@ -1680,7 +1680,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
             fused_comp, fused_state_kv, fused_state_score, kv, sc,
             model_raw, model_bytes, 0, 1, norm_offset, 0,
             head_dim, 0, n_tokens, 0, 0, false,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
 
         // Restore finite sources and the candidate's original replay state.
         for (uint64_t i = 0; i < input_count; i++) {
@@ -1706,7 +1706,7 @@ static void test_metal_compressor_ratio4_replay_pack_exact_case(
             fused_comp, fused_state_kv, fused_state_score, kv, sc,
             model_raw, model_bytes, 0, 1, norm_offset, 0,
             head_dim, 0, n_tokens, 0, 0, false,
-            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f) != 0);
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL) != 0);
 
         TEST_ASSERT(ds4_gpu_tensor_read(
                         kv, 0, source_after_host, input_bytes) != 0);
@@ -1974,13 +1974,13 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
                 ref_comp, ref_state_kv, ref_state_score, kv, sc,
                 model_raw, model_bytes, 0, ape_type, norm_offset, 0,
                 head_dim, pos0, n_tokens, 0, 0, false,
-                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL);
         } else {
             ref_ok = ds4_gpu_compressor_prefill_tensor(
                 ref_comp, ref_state_kv, ref_state_score, kv, sc,
                 model_raw, model_bytes, 0, ape_type, norm_offset, 0,
                 head_dim, ratio, pos0, n_tokens, 0, 0, false,
-                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL);
         }
         TEST_ASSERT(ref_ok != 0);
         TEST_ASSERT(ds4_gpu_tensor_read(
@@ -2000,13 +2000,13 @@ static void test_metal_compressor_ratio4_direct_pool_exact_case(
                 direct_comp, direct_state_kv, direct_state_score, kv, sc,
                 model_raw, model_bytes, 0, ape_type, norm_offset, 0,
                 head_dim, pos0, n_tokens, 0, 0, false,
-                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL);
         } else {
             direct_ok = ds4_gpu_compressor_prefill_tensor(
                 direct_comp, direct_state_kv, direct_state_score, kv, sc,
                 model_raw, model_bytes, 0, ape_type, norm_offset, 0,
                 head_dim, ratio, pos0, n_tokens, 0, 0, false,
-                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f);
+                10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1.0e-6f, NULL);
         }
         TEST_ASSERT(direct_ok != 0);
         TEST_ASSERT(ds4_gpu_tensor_read(

@@ -28740,7 +28740,7 @@ static bool metal_graph_encode_layer_attention_batch(
             ok = false;
         }
         if (ok) {
-#if defined(__APPLE__)
+#if !defined(DS4_ROCM_BUILD)
             ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                              model->map,
                                              model->size,
@@ -29096,7 +29096,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
-#if defined(__APPLE__)
+#if !defined(DS4_ROCM_BUILD)
                 ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
                                                  model->map,
                                                  model->size,
