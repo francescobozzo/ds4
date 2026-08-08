@@ -2877,7 +2877,18 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     }
 }
 
-template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_iq2_xxs(
+#if defined(__gfx1151__)
+static __device__ __forceinline__ uint32_t iq2_xxs_apply_sign4(
+        const uint32_t grid, const uint32_t signs) {
+    const uint32_t bits = signs & 0x0fu;
+    const uint32_t add = (bits * 0x00204081u) & 0x01010101u;
+    // IQ2 grid bytes are nonzero, so per-byte two's-complement negation
+    // cannot carry into an adjacent byte.
+    return (grid ^ (add * 0xffu)) + add;
+}
+#endif
+
+template <int mmq_y, bool need_check, int fixed_stride = 0> static __device__ __forceinline__ void load_tiles_iq2_xxs(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int nwarps = mmq_get_nwarps_device();
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -2895,7 +2906,12 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     constexpr int nrows = warp_size / threads_per_row;
     const int kqsx = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
 
+#if defined(__gfx1151__)
+// Limit concurrent row decompression while retaining two-row ILP.
+#pragma unroll 2
+#else
 #pragma unroll
+#endif
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
 
@@ -2903,7 +2919,12 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
             i = min(i, i_max);
         }
 
-        const block_iq2_xxs * bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
+        const block_iq2_xxs * bxi;
+        if constexpr (fixed_stride != 0) {
+            bxi = (const block_iq2_xxs *) x + kbx0 + i*fixed_stride;
+        } else {
+            bxi = (const block_iq2_xxs *) x + kbx0 + i*stride;
+        }
 
         const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
         const uint8_t * aux8 = (const uint8_t *) &q2;
@@ -2912,6 +2933,22 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
             const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+#if defined(__gfx1151__)
+            const uint32_t sign_bits = (aux32 >> (7 * l)) & 0x7fu;
+            int grid0;
+            int grid1;
+            if constexpr (fixed_stride == 16) {
+                const uint2 sign_mask = ((const uint2 *) ksigns64)[sign_bits];
+                const uint32_t add0 = sign_mask.x & 0x01010101u;
+                const uint32_t add1 = sign_mask.y & 0x01010101u;
+                grid0 = (grid_pos.x ^ sign_mask.x) + add0;
+                grid1 = (grid_pos.y ^ sign_mask.y) + add1;
+            } else {
+                const uint32_t signs = sign_bits | ((__popc(sign_bits) & 1u) << 7);
+                grid0 = iq2_xxs_apply_sign4(grid_pos.x, signs);
+                grid1 = iq2_xxs_apply_sign4(grid_pos.y, signs >> 4);
+            }
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -2919,6 +2956,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l + 0)] = grid0;
@@ -2967,7 +3005,11 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
     const half  * dq = (const half  *)  x;
     const uint2 * qs = (const uint2 *) (x + dq_bytes);
 
+#if defined(__gfx1151__)
+#pragma unroll 2
+#else
 #pragma unroll
+#endif
     for (int i0 = 0; i0 < mmq_y; i0 += nwarps * nrows) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
 
@@ -2987,6 +3029,13 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
             const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+#if defined(__gfx1151__)
+            const uint32_t sign_bits = (aux32 >> (7 * l)) & 0x7fu;
+            const uint32_t signs = sign_bits | ((__popc(sign_bits) & 1u) << 7);
+
+            const int grid0 = iq2_xxs_apply_sign4(grid_pos.x, signs);
+            const int grid1 = iq2_xxs_apply_sign4(grid_pos.y, signs >> 4);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -2994,6 +3043,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
 
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*MMQ_MMA_TILE_X_K_Q8_0 + 8*kqsx + (2*l + 0)] = grid0;
@@ -3710,7 +3760,8 @@ template <
     int mmq_x,
     bool need_check,
     bool fixup,
-    bool sanitize_output>
+    bool sanitize_output,
+    bool iq2_raw_stride16 = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -3767,7 +3818,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             }
         } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
-            if (x_soa != nullptr) {
+            if constexpr (iq2_raw_stride16) {
+                load_tiles_iq2_xxs<mmq_y, need_check, 16>(
+                    x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            } else if (x_soa != nullptr) {
                 load_tiles_iq2_xxs_soa<mmq_y, need_check>(x_soa, soa_blocks, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
             } else {
                 load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
@@ -3821,7 +3875,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int mmq_x, bool need_check, bool sanitize_output>
+template <ggml_type type, int mmq_x, bool need_check, bool sanitize_output, bool iq2_raw_stride16 = false>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
     __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
@@ -3931,7 +3985,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_soa, soa_blocks,
              epilogue_gate ? epilogue_gate + offset_dst : nullptr,
@@ -4022,7 +4076,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
+        mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
              epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -4093,7 +4147,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output>
+    mul_mat_q_process_tile<type, mmq_x, need_check, fixup, sanitize_output, iq2_raw_stride16>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, x_soa, soa_blocks,
          epilogue_gate, epilogue_weights, epilogue_mid, epilogue_mid_h,
@@ -4321,6 +4375,33 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(!args.epilogue_mid || !args.use_stream_k);
 
     if (!args.use_stream_k) {
+#if defined(GGML_USE_HIP)
+        // The gfx1151 routed DeepSeek gate/up shape uses raw IQ2 weights with
+        // 16 blocks per row. Keep one specialization instead of duplicating
+        // the complete raw/SoA MMQ family.
+        if constexpr (type == GGML_TYPE_IQ2_XXS && mmq_x == 80) {
+            if (cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+                args.ids_dst != nullptr && !args.sanitize_output &&
+                args.x_soa == nullptr && args.stride_row_x == 16 &&
+                args.nrows_x % mmq_y == 0) {
+                constexpr bool need_check = false;
+                constexpr bool sanitize_output = false;
+                constexpr bool iq2_raw_stride16 = true;
+                mul_mat_q<type, mmq_x, need_check, sanitize_output, iq2_raw_stride16>
+                    <<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>(
+                        args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr,
+                        blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x,
+                        args.ncols_y, args.nrows_dst, channel_ratio_fd, nchannels_y_fd,
+                        args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                        sample_ratio_fd, nsamples_y_fd, args.stride_sample_x,
+                        args.stride_sample_y, args.stride_sample_dst, ntx_fd,
+                        args.x_soa, args.soa_blocks, args.epilogue_gate,
+                        args.epilogue_weights, args.epilogue_mid, args.epilogue_mid_h,
+                        args.epilogue_clamp);
+                return;
+            }
+        }
+#endif
         const auto launch_tiled = [&](auto sanitize_tag) {
             constexpr bool sanitize_output = decltype(sanitize_tag)::value;
             if (args.nrows_x % mmq_y == 0) {
