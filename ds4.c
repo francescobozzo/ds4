@@ -12150,10 +12150,25 @@ static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
 
 #define DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK 2048u
 
+/* ROCm prefill throughput improves with wider chunks: the routed MoE tiles fill
+ * completely instead of padding, and per-tile activation staging amortizes over
+ * more work.  Measured on gfx1151 with 8,192-token intervals, chunk 4,096 versus
+ * 8,192 gave 359.68/361.72/336.28/319.09 versus
+ * 361.08/378.51/351.45/331.14 t/s at 8K/16K/24K/32K, and a 2,048-token chunk
+ * fell to 314.96 t/s at 8K.  Full-logit hashes are identical at every chunk
+ * size, so this is purely a scheduling choice.  It costs about 389 MiB more
+ * context workspace at 8K context. */
+#define DS4_ROCM_DEFAULT_PREFILL_CHUNK 8192u
+
 static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
                                             uint32_t requested_chunk) {
     if (requested_chunk != 0) return requested_chunk;
-    return cuda_tensor_parallel ? DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK : 0;
+    if (cuda_tensor_parallel) return DS4_CUDA_TP_DEFAULT_PREFILL_CHUNK;
+#ifdef DS4_ROCM_BUILD
+    return DS4_ROCM_DEFAULT_PREFILL_CHUNK;
+#else
+    return 0;
+#endif
 }
 
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
@@ -36250,7 +36265,7 @@ static uint32_t glm_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS 0u
 #define DS4_GLM_METAL_LONG_CONTEXT_THRESHOLD 65536u
 #define DS4_GLM_METAL_LONG_CONTEXT_FULL_ATTN_CONTEXT 4096u
-#define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
+#define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 8192u
 #define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
