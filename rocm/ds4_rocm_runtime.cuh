@@ -4833,8 +4833,17 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
             cuda_env_present(getenv("DS4_ROCM_GRAPH_DUMP_NONINVASIVE"));
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
-        g_rocm_cfg.q8_decode_rpb = g_rocm_gfx1151 ? 16u : 1u;
-        g_rocm_cfg.q8_hc_decode_rpb = g_rocm_gfx1151 ? 32u : 16u;
+        /* Row-group width sets the workgroup size and therefore how many
+         * workgroups a decode GEMV splits into. At out_dim=2048 the HC-expand
+         * kernel's default of 32 gives 1024-thread workgroups and only 64 of
+         * them for 40 CUs, so it runs 1.6 rounds with a poor tail; it measures
+         * 117.7 us for 8.9 MB, 31% of peak, against a 37 us roofline. Grouping
+         * is bit-exact -- each row's reduction is one wave over `b += 32`
+         * regardless -- so expose both as tunables. */
+        g_rocm_cfg.q8_decode_rpb = cuda_rows_per_block_env_or_default(
+            "DS4_ROCM_Q8_DECODE_RPB", g_rocm_gfx1151 ? 16u : 1u);
+        g_rocm_cfg.q8_hc_decode_rpb = cuda_rows_per_block_env_or_default(
+            "DS4_ROCM_Q8_HC_DECODE_RPB", g_rocm_gfx1151 ? 32u : 16u);
         g_rocm_cfg.attn_out_low_decode_rpb = g_rocm_gfx1151 ? 16u : 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
