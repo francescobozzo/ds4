@@ -94,15 +94,15 @@ rounds against the same baseline binary.
 
 | Frontier | Baseline `76a7755` | Current | Gain |
 | ---: | ---: | ---: | ---: |
-| 4K | 325.35 t/s | **367.54 t/s** | **+13.0%** |
-| 8K | 362.13 t/s | **401.48 t/s** | **+10.9%** |
+| 4K | 330.27 t/s | **370.38 t/s** | **+12.1%** |
+| 8K | 361.68 t/s | **404.95 t/s** | **+12.0%** |
 
-Means of **four** alternating pairs in one script; all eight pairs positive. The
-8K candidate runs read 402.05 / 401.15 / 401.55 / 401.18, so every individual
-run clears 400 and the spread is ±0.11%. Baseline 8K spread was 360.59-363.18.
+Means of three alternating pairs; all six positive. The 8K candidate runs read
+404.75 / 405.01 / 405.09, a ±0.04% spread, so every run clears 400 with margin.
+Baseline 8K spread was 361.31-362.01.
 
-**The 400 t/s goal is met at the steady-state frontier: 401.48 t/s.** The 4K row
-is 367.54 and still carries roughly a second of unavoidable first-use setup
+**The 400 t/s goal is met at the steady-state frontier: 404.95 t/s.** The 4K row
+is 370.38 and still carries roughly a second of unavoidable first-use setup
 inside its measured window (see below), so it is not the number to compare
 against a steady rate.
 
@@ -215,6 +215,10 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-a08-indexer-register-acc` | `indexer_scores_wmma128` kept 8,192 B of `c_sh` purely to redistribute each warp's 16x16 result so all 256 threads could stripe across all eight warp tiles, costing a store, a barrier and a strided read per head, 64 heads deep. Using the accumulator layout from `ds4-a02`, each warp instead accumulates *its own* tile in registers: element `e` of lane `l` is row `2e + l/16`, col `l % 16`, and the per-row weight `weights[(tile_t + row) * n_head + h]` is therefore computable per element. LDS 12,288 -> 4,096 B, so residency stops being LDS-bound | **8K 401.48 -> 404.95 (+0.9%), 4K 367.54 -> 370.38.** Three alternating pairs, ±0.04% spread. **Bit-exact and asserted**: the full-vocabulary dumps at 2K and 4K are byte-identical to the build before it, which is the strongest available check that the hand-derived lane mapping is right. Each output element still accumulates over heads in ascending order; only which thread owns it changed | **Retained** |
+| `ds4-a09-indexer-b-from-global` | Go further and delete `b_sh` too, the other 32,768 B, by pre-converting `index_comp` to F16 once per chunk and loading B fragments straight from global | **Rejected on paper, no build.** `b_sh` is staged once and reused by all 64 heads; serving those fragments from global re-reads 128x128x2 B per head per block, which is 2 MB per block and **8.4 GB** over the grid. Even as MALL hits that is at best a wash against the 15.8 ms the kernel costs now. The LDS staging is doing real work | **Rejected** |
+| `ds4-a10-indexer-half-tile` | Halve the comp tile to 64 columns so `b_sh` fits two workgroups per CU | **Rejected on paper, no build.** 16-wide WMMA tiles mean 64 columns admits only 4 warps, so it is 2 workgroups x 128 threads = 256 threads per CU — **identical** to today's 1 x 256. No occupancy gained | **Rejected** |
+| `ds4-x01-pmc-roofline` | Settle the inherited "both MoE matmuls are bandwidth-bound" verdict by reading `FETCH_SIZE`, `WRITE_SIZE`, `L2CacheHit` and `MemUnitBusy`, then dividing measured bytes by trace durations for true GB/s | **Blocked by the hardware.** `rocprofv3` returns *"Could not construct profile cfg failed with error code 38: Request exceeds the capabilities of the hardware to collect"* for four counters **and for two** — `FETCH_SIZE`/`WRITE_SIZE` are derived TCC metrics needing more slots than gfx1151 exposes. Worse, on that failure rocprofv3 aborts (signal 6) and then **hangs forever in its own signal handler** rather than exiting, so any wait-for-sentinel loop waits on a dead process; kill it by PID. Try one counter at a time, or get the byte count analytically from model dims instead | **Blocked** |
 | `ds4-e03-head-rope-lds` | `head_rms_norm_rope_tail_kernel` touches global memory three times per row: once to square, once to scale the non-rotated head, once to read the rotated tail back. The row is 512 floats, so stage it in 2 KiB of LDS beside the existing reduction scratch and serve the second and third passes from there. Values, reduction tree and per-element arithmetic all unchanged | **8K 362.13 -> 401.48 (+10.9%), 4K 325.35 -> 367.54 (+13.0%)** for the retained set, four alternating pairs, all eight positive, every candidate run above 400. Bit-exact as designed: the logit envelope is identical to eight decimals against the build before it | **Retained** |
 | `ds4-a04-static-attn-single-pass` | Give `attention_static_mixed_heads8_online_kernel` the same single-pass treatment. Here the accumulators are plain `float4` registers, so the rescale is trivial, and dropping the 24 KiB score array takes LDS from 32,768 to 8,192 B | **Rejected on quality.** Faster, but only +0.25 t/s at 8K (398.76 -> 399.01) because the kernel runs 11 times per frontier, and it moved three of four quality metrics the wrong way: 4K top-20 20/20 -> 19/20, RMS 0.171 -> 0.216, max delta 0.952 -> 1.194. The kernel's own comment records that "the previous online recurrence was close, but crossed greedy near-ties on long prompts" — that warning is real, and a running maximum on *this* kernel costs more accuracy than it buys speed. Reverted; the two-pass global maximum stays | **Rejected** |
 | `ds4-a05-indexer-barrier` | `indexer_scores_wmma128` runs three barriers per head across 64 heads. The third is redundant: the next head writes `c_sh` only after its own post-staging barrier, which already orders every thread's `c_sh` reads against that write, and it writes `a_sh`, a different array; the epilogue reads only registers | +0.8 t/s at 8K (397.94 -> 398.76), consistent across three runs and tighter than the run it replaced. Bit-exact by construction | **Retained** |
@@ -247,7 +251,7 @@ there is no launch gap to recover.
 | attention output B (our WMMA kernel) | 551 | 21.2 TFLOP/s, was 10.7 |
 | `attention_static_mixed_heads8_online` | 450 | Two-pass, and a single pass was rejected on quality |
 | Tensile `MT96x96` + `MT32x32` projections | 487 | Tensile wins these; measured twice, isolated and in-app |
-| `indexer_scores_wmma128` | 331 | 45,056 B LDS, one workgroup per CU |
+| `indexer_scores_wmma128` | ~290 | LDS 45,056 -> 36,864 B; `b_sh` is the irreducible 32,768 |
 | `head_rms_norm_rope_tail` | ~210 | Was 312; now one read and one write per row |
 
 The two MoE matmuls are now **53% of the frontier** and both are at the memory
@@ -261,7 +265,7 @@ gain is now closed in both directions, and the attention seam is half-closed.
 | ID | Experiment | Predicted | Gate |
 | :--- | :--- | --- | --- |
 | `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 931 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything. Now the largest unexamined kernel | Unknown; a counter read either opens or closes it | n/a, measurement only |
-| `ds4-a03-indexer-lds` | `indexer_scores_wmma128` uses 45,056 B of LDS with only 256 threads, so it is one workgroup and 4 waves per SIMD. `b_sh` alone is 32,768 B; halving the comp tile to 64 columns would fit two workgroups at the cost of doubling the `a_sh` re-reads | -60 to -80 ms per frontier | Changes the accumulation split; logit envelope |
+| `ds4-x02-moe-roofline-analytic` | The inherited "both MoE matmuls are bandwidth-bound at ~27 and ~30 FLOP/byte" verdict covers **53% of the frontier** and has never been verified on this branch. PMC is blocked (`ds4-x01`), so get the bytes analytically: instrument one `fprintf` of the routed dims (`n_expert`, `n_expert_used`, `inter_dim`, `n_embd`), then divide by the trace durations already collected. There is a reason to doubt the verdict — `speed-bench/gb10.csv` shows 825-899 t/s at the same 2,048 chunk, 2.2x ours, on a platform with **273 GB/s against our 242**. Two systems at the same memory bandwidth cannot differ 2.2x if both are memory-bound | Decides whether 4,052 ms per frontier has headroom or is closed | Measurement only; one `fprintf` build |
 | `ds4-a07-mixed32-lds` | `attention_mixed_heads32_wmma` is still one workgroup per CU at 58,368 B, of which `q_half` is 33,024. Two workgroups needs 32,768 B total, which is unreachable while a block owns 32 heads. The prior 16-head split was measured at 1,428 -> 2,305 ms, so this needs a different decomposition, not a smaller one | Unknown; likely closed | — |
 | `ds4-m02-moe-64-row-tile` | The two MoE matmuls remain the **only** kernels that scale sub-linearly with chunk width: per token per layer, IQ2 gate/up costs 12.58 us at a 4,096-token chunk against 10.52 us at 8,192 (**-16.4%**), and Q2 down 10.68 against 9.46 (**-11.5%**); everything else is flat to within 1%. `ds4-m01` proved it is not column-tile fill, so it is the 64-row destination granularity and per-tile activation amortisation | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if the tail arithmetic is unchanged |
 | `ds4-q01-repack-iq2` | Row-pair-interleaved 64 B-aligned IQ2 repack, the last untried fork idea. Removes 2-byte-aligned split loads | Unknown | Exact hashes; in place, no extra resident bytes |
