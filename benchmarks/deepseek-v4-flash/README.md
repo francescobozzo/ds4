@@ -215,6 +215,7 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-m03-mmq-act-prefetch` | The ablations above point at activations, not weights, and unlike the quant-specific weight loader the activation staging is a plain int copy. The two halves are staged-consumed-staged-consumed, so the second half's global read latency sits on the critical path with no other wave to cover it at 4 waves/SIMD. Issue the second half's reads before the first barrier and commit them to LDS only after the first `vec_dot`, so they fly across a barrier and a whole matrix-multiply phase. Bit-identical by construction: same words, same places, same K order. About 21 registers against a 384-VGPR budget at this occupancy | **Rejected, and badly: IQ2 25.375 -> 33.134 ms per call, +30.6%.** Dense Q8 went the other way, 4.330 -> 4.243, **-2.0%**, with VGPRs 192 -> 216. The difference is register headroom: IQ2's VGPRs *fell* 168 -> **136** with **zero scratch**, so the compiler either sank the loads back to their use site or 21 extra outstanding VMEM requests per thread exhausted the issue pipeline. Either way IQ2 has no headroom, matching the worklog's earlier finding that lower VGPR tiers lose badly on this kernel. Gating the prefetch to dense Q8 alone would be worth +0.2% of prefill and was not taken | **Rejected** |
 | `ds4-a08-indexer-register-acc` | `indexer_scores_wmma128` kept 8,192 B of `c_sh` purely to redistribute each warp's 16x16 result so all 256 threads could stripe across all eight warp tiles, costing a store, a barrier and a strided read per head, 64 heads deep. Using the accumulator layout from `ds4-a02`, each warp instead accumulates *its own* tile in registers: element `e` of lane `l` is row `2e + l/16`, col `l % 16`, and the per-row weight `weights[(tile_t + row) * n_head + h]` is therefore computable per element. LDS 12,288 -> 4,096 B, so residency stops being LDS-bound | **8K 401.48 -> 404.95 (+0.9%), 4K 367.54 -> 370.38.** Three alternating pairs, ±0.04% spread. **Bit-exact and asserted**: the full-vocabulary dumps at 2K and 4K are byte-identical to the build before it, which is the strongest available check that the hand-derived lane mapping is right. Each output element still accumulates over heads in ascending order; only which thread owns it changed | **Retained** |
 | `ds4-a09-indexer-b-from-global` | Go further and delete `b_sh` too, the other 32,768 B, by pre-converting `index_comp` to F16 once per chunk and loading B fragments straight from global | **Rejected on paper, no build.** `b_sh` is staged once and reused by all 64 heads; serving those fragments from global re-reads 128x128x2 B per head per block, which is 2 MB per block and **8.4 GB** over the grid. Even as MALL hits that is at best a wash against the 15.8 ms the kernel costs now. The LDS staging is doing real work | **Rejected** |
 | `ds4-a10-indexer-half-tile` | Halve the comp tile to 64 columns so `b_sh` fits two workgroups per CU | **Rejected on paper, no build.** 16-wide WMMA tiles mean 64 columns admits only 4 warps, so it is 2 workgroups x 128 threads = 256 threads per CU — **identical** to today's 1 x 256. No occupancy gained | **Rejected** |
@@ -260,6 +261,33 @@ dense Q8 are neither bandwidth- nor compute-bound**: 13-23% of bandwidth *and*
 14-16% of compute. That is a latency signature, and together they are 29% of the
 frontier.
 
+### What the MMQ latency actually is, by ablation
+
+PMC is unusable here, so the kernel was decomposed with two throwaway builds
+that pin a source pointer so its loads stay cache-resident. Results are wrong by
+design; both probes were confirmed live (the weight probe moves the 4K logits by
+max 23.37 with top-20 4/20). Each figure is the ceiling for removing that
+traffic *and* its latency entirely.
+
+| Kernel | weight loads free | activation loads free |
+| --- | ---: | ---: |
+| `mul_mat_q<IQ2_XXS,80>` | -12.6% | **-21.0%** |
+| `mul_mat_q<Q8_0,80>` | -0.1% | **-11.1%** |
+
+Three things follow, and they reorder the queue:
+
+1. **Activations cost more than weights**, roughly 2:1 on IQ2. A weight prefetch
+   — the obvious reading of "latency-bound" — is capped at -12.6% of one kernel,
+   i.e. +2.6% of prefill for a *perfect* implementation, and a real one captures
+   only the latency half of that. Not worth vendored MMQ surgery.
+2. **Dense Q8's weight loads are already fully hidden** (-0.1%). Its latency is
+   entirely elsewhere.
+3. Even making **all** memory traffic free buys about 34% of the IQ2 kernel, so
+   the other two thirds is the IQ2 dequantization VALU path, LDS traffic and
+   barriers. That is consistent with 14% of the int8 ceiling and with the
+   worklog's own counter sweep (1,006 VALU per wave, LDS:VALU 18.7%), and it is
+   the direction the retained IQ2 loader work already mined for -10.5%.
+
 ### Why MMQ occupancy is nonetheless closed
 
 The cause is occupancy, which the worklog measured but did not connect: 128
@@ -287,6 +315,49 @@ hiding at fixed occupancy** — prefetching the next K-block's weight tile into
 registers during the current tile's `mma`, the same recipe that gave the Qwen
 attention kernel 1.12-1.30x. That is surgery on vendored MMQ and is the largest
 single untried item in prefill.
+
+## The MoE chunk-width sub-linearity, diagnosed
+
+The two MoE matmuls are the only kernels whose *per-token* cost depends on chunk
+width: IQ2 gate/up costs 12.58 us per token per layer at a 4,096-token chunk
+against 10.52 at 8,192 (**-16.4%**), Q2 down 10.68 against 9.46 (**-11.5%**).
+Everything else is flat to within 1%. Two hypotheses are now dead and the third
+fits exactly.
+
+**Not column-tile fill.** With 256 experts and top-6, a 4,096-token chunk gives
+96 tokens per expert on average, so at `mmq_x = 80` the second column tile is a
+fifth full. `x = 48` would give two exactly-full tiles for the same weight
+passes — and measured **slower** (372.1 against 377.5 at 8K), with a cliff to
+334 at x <= 40. The padded columns are nearly free, which is what 14% of the
+int8 ceiling predicts.
+
+**It is per-column-tile-pass overhead.** Passes per expert are
+`ceil(tokens_per_expert / mmq_x)`, so per *token* they fall from
+`256 x 2 / 4096 = 0.1250` to `256 x 3 / 8192 = 0.0938` — exactly **-25%**. If a
+fraction `f` of the kernel is per-pass rather than per-real-work, the observed
+-16.4% gives `f = 16.4 / 25 = 0.66`.
+
+That 0.66 is independently corroborated: the ablations put memory at 34% of the
+IQ2 kernel, and the remaining two thirds is dequantization work, which happens
+once per weight-tile load and is therefore *also* per pass. 66% per-pass plus
+34% per-real-byte accounts for the whole kernel.
+
+**So the fix is fewer passes per token, and the obvious route is blocked.**
+Raising `mmq_x` to 96 would put a 96-token expert in one pass, halving passes.
+But `tile_y` scales with `mmq_x`: at `MMQ_TILE_Y_K = 36` and `mmq_y = 64`, LDS
+goes from `19,456 + 12,096 = 31,552` B to `19,456 + 14,208 = 33,664` B, which
+crosses the 32,768 B needed for two workgroups per CU and **halves occupancy to
+4 waves per CU** to save 33% of 66% = 22% of the kernel. On a latency-bound
+kernel that trade is very likely negative, which is presumably why the HIP cap
+is 80.
+
+The route that is *not* blocked is per-expert width selection: `hot_max` is 455
+against an average of 96, so a single width is wrong for both ends of the
+distribution. Bucketing experts by token count and issuing one launch per width
+bucket — PR 887's tail-tile specialization, which it measured at +4.2% on the
+CUDA-only D2R path — cuts padding without raising LDS for the small buckets.
+That is the retained recommendation for `ds4-m02`, and it is a change to the
+routed launch path rather than to the kernel.
 
 ## Decode: 4x headroom, and it is not bandwidth
 
@@ -348,9 +419,9 @@ gain is now closed in both directions, and the attention seam is half-closed.
 | :--- | :--- | --- | --- |
 | `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 931 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything. Now the largest unexamined kernel | Unknown; a counter read either opens or closes it | n/a, measurement only |
 | `ds4-tg01-decode-fusion` | **Largest opportunity in the model.** Decode runs at 25.5% of the DRAM ceiling with ~1,560 dispatches per token and no kernel above 12%. Fuse the per-layer decode chain — `hc_expand_preq`, `q8_preq_rows`, `grouped_a_preq`, `pair_preq` are seven-plus launches per layer, several of them 60-120 us, i.e. too short to saturate. Start by counting launches per layer and merging the ones sharing an activation | 15.3 -> plausibly 25-35 tok/s; ceiling is 60 | Greedy equality per prompt; decode is currently bit-identical to baseline so any change must re-establish that |
-| `ds4-m03-mmq-kloop-prefetch` | IQ2 gate/up and dense Q8 are **29% of the frontier** at 13-23% of bandwidth and 14-16% of compute, with occupancy structurally pinned at 4 waves/SIMD (see the roofline section). The remaining lever is latency hiding at fixed occupancy: prefetch the next K-block's weight tile into registers during the current tile's `mma`, as `opt-c178-attn-prefetch` did for Qwen attention at 1.12-1.30x | -200 to -500 ms per frontier | Bit-identical by construction if the staged bytes and mma order are untouched; surgery on vendored MMQ, so build against the parity suite first |
+| `ds4-m03-mmq-kloop-prefetch` | **Closed by measurement.** Weight prefetch is capped at +2.6% of prefill by ablation, and the activation prefetch that the ablations recommended measured +30.6% on the IQ2 kernel. See the two entries in the log. What remains on these kernels is the dequantization instruction path, not memory | Closed | — |
 | `ds4-a07-mixed32-lds` | `attention_mixed_heads32_wmma` is still one workgroup per CU at 58,368 B, of which `q_half` is 33,024. Two workgroups needs 32,768 B total, which is unreachable while a block owns 32 heads. The prior 16-head split was measured at 1,428 -> 2,305 ms, so this needs a different decomposition, not a smaller one | Unknown; likely closed | — |
-| `ds4-m02-moe-64-row-tile` | The two MoE matmuls are still the only kernels that scale sub-linearly with chunk width: per token per layer IQ2 gate/up costs 12.58 us at a 4,096-token chunk against 10.52 at 8,192 (-16.4%), Q2 down 10.68 against 9.46 (-11.5%). `ds4-m01` proved it is not column-tile fill, so it is the 64-row destination granularity and per-tile activation amortisation | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if the tail arithmetic is unchanged |
+| `ds4-m02-moe-width-buckets` | **Diagnosed; see the sub-linearity section.** The mechanism is per-column-tile-pass overhead, 66% of the IQ2 kernel, and raising `mmq_x` to reduce passes is blocked by a 33,664 B LDS footprint that halves occupancy. The open route is bucketing experts by token count (`hot_max` 455 vs mean 96) and issuing one launch per width bucket | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if per-bucket accumulation order is unchanged |
 | `ds4-q01-repack-iq2` | Row-pair-interleaved 64 B-aligned IQ2 repack, the last untried fork idea. Removes 2-byte-aligned split loads | Unknown | Exact hashes; in place, no extra resident bytes |
 | `ds4-b01-blas-candidates` | The pinned hipBLASLt candidates (4/5/6) were chosen for determinism, not speed. Sweep the index and allow non-zero workspace | **Closed by the harness**: candidate 4 is within 4% of the best zero-workspace candidate on every shape, and a 64 MiB workspace unlocks no new solution — every candidate reports `workspaceSize = 0` | Closed |
 
