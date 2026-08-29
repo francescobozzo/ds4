@@ -123,7 +123,13 @@ static int get_mmq_x_max_host(const int cc) {
     // RDNA 3.5 peaks at x=80 for the IQ2_XXS routed-MoE workload.
 #if defined(GGML_USE_HIP)
     if (base > 80) base = 80;
-#else
+#endif
+    // The selector below picks the smallest x that minimises the tile count for
+    // args.ncols_max, and the routed path passes the whole chunk width there, so
+    // it always lands on the cap. Per expert the real column count is far
+    // smaller -- about n_tokens * n_expert_used / n_expert -- and a tile only
+    // partly filled still pays its full weight load and mma. Keep the cap
+    // tunable on every backend so the fill can be swept against a real chunk.
     static int g_override_init = 0;
     static int g_override      = 0;
     if (!g_override_init) {
@@ -138,7 +144,6 @@ static int get_mmq_x_max_host(const int cc) {
         }
     }
     if (g_override > 0 && g_override < base) base = g_override;
-#endif
     return base;
 }
 
