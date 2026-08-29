@@ -1129,20 +1129,36 @@ __global__ static void matmul_q8_0_hc_expand_preq_rows_w32_kernel(
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0u) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
-        if (has_add) block_v += block_add[d];
+    /* The epilogue used to run entirely on lane 0: an `n_hc` x `n_hc` walk with
+     * the `residual_hc` reads and `out_hc` writes all issued by one lane, eight
+     * dependent single-lane global accesses per output row with 31 lanes idle.
+     * At ~1,000 cycles a miss that is ~8,000 cycles per row, which is the right
+     * order for this kernel's 117.7 us per call and its 31% of DRAM peak -- the
+     * GEMV itself only reads 136 B per wave.
+     *
+     * Give each `dst_hc` its own lane instead. The four `residual_hc` addresses
+     * are then requested by four lanes concurrently rather than serially, so the
+     * chain collapses from eight rounds of latency to about two.
+     *
+     * Bit-exact: every output still accumulates over `src_hc` in ascending order
+     * from the same values; only the lane that owns it changed. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    acc = __shfl(acc, 0, 32);
+#else
+    acc = __shfl_sync(FULL_WARP_MASK, acc, 0, 32);
+#endif
+    const uint32_t d = (uint32_t)row;
+    if (lane == 0u) block_out[d] = acc;
+    float block_v = acc;
+    if (has_add) block_v += block_add[d];
+    if (lane < n_hc) {
         const float *post = split + n_hc;
         const float *comb = split + 2u * n_hc;
-        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
-            float hc_acc = block_v * post[dst_hc];
-            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-                hc_acc += residual_hc[(uint64_t)src_hc * n_embd + d] * comb[(uint64_t)src_hc * n_hc + dst_hc];
-            }
-            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        float hc_acc = block_v * post[lane];
+        for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+            hc_acc += residual_hc[(uint64_t)src_hc * n_embd + d] * comb[(uint64_t)src_hc * n_hc + lane];
         }
+        out_hc[(uint64_t)lane * n_embd + d] = hc_acc;
     }
 }
 
