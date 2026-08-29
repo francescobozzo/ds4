@@ -235,7 +235,89 @@ and the decision, so rejected directions are not retried.
 | `ds4-e02-head-rope-wave` | Same treatment for `head_rms_norm_rope_tail_kernel`, the largest elementwise kernel at 7.27 ms per call, on the assumption that 256 threads per 128-element row wasted three quarters of the block on the `powf`/`cosf`/`sinf` tail | **Inert, then closed by arithmetic.** `head_dim` exceeds 256 so the guard never selected the new kernel. Recomputing with the real geometry: 262,144 rows x 512 floats, read twice and written once, is 1.6 GB, so 7.27 ms is **89% of roofline**. The 4.4x gap was an artefact of guessing `head_dim = 128`. The kernel was deleted rather than left behind a guard | **Rejected** |
 | `ds4-t01-transpose-tile` | `dequant_q8_0_to_f16_transpose_kernel` gives each lane the private output address `i * out_dim + row`, so a wave's 32 stores land 8,192 B apart: 32 cache lines for 64 B of payload, and `(8192 / 256) % 16 == 0` puts all of them on one memory channel — 1.9 GB/s measured, about 25x off roofline. Stage a 32-`i` x 64-`row` tile in LDS, keep reads wave-contiguous, write 64 consecutive halves, and put `row` on `blockIdx.x` so concurrent blocks span the full `out_dim` row and cover all 16 channels | Bit-identical by construction, and the kernel disappears from the top of the trace. **PP-neutral** (328.47 -> 328.46 at 4K over three alternating pairs): the 2,453 ms it removes is startup, in the phase before the first measured frontier, not inside it. Kept for the ~2.3 s it takes off first-prompt latency, but it is not a prefill win | **Retained, no PP gain** |
 
-### Where the time now is
+## Measured Rooflines
+
+Dimensions recovered by instrumenting the launchers once (`n_embd = 4096`,
+`expert_mid_dim = 2048`, `n_total_expert = 256`, `n_expert_used = 6`, 43 layers,
+`down_expert_bytes = 2,752,512` confirming Q2_K at 2.625 bpw). The implied
+resident size is 74.6 GiB against the actual 80.76 GiB, the balance being
+embeddings, output head, attention and shared-expert weights, which validates
+the routed and dense figures.
+
+**This overturns the verdict the previous worklog carried.** It stated both MoE
+matmuls were "bandwidth-bound at ~27 and ~30 FLOP/byte" and closed them. Only
+one of them is.
+
+| Kernel | ms/frontier | GFLOP/layer | TFLOP/s | % compute peak | GB/s | % of 242 GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mul_mat_q<IQ2_XXS,80>` gate/up | 2,182 | 825 | 16.3 | ~14% (int8) | ~55 | **23%** |
+| `moe_down_q2K_hotlist_wmma_wide` | 1,870 | 412 | 9.5 | 16% | ~147 | **61%** |
+| `mul_mat_q<Q8_0,80>` dense | 931 | 395 | 18.3 | ~16% (int8) | ~32 | **13%** |
+
+Q2 down at 61% of DRAM peak, with activations 92% of its bytes, is genuinely
+near the memory wall — that part of the old verdict holds. **IQ2 gate/up and
+dense Q8 are neither bandwidth- nor compute-bound**: 13-23% of bandwidth *and*
+14-16% of compute. That is a latency signature, and together they are 29% of the
+frontier.
+
+### Why MMQ occupancy is nonetheless closed
+
+The cause is occupancy, which the worklog measured but did not connect: 128
+threads is 4 waves, 30.8 KiB of dynamic LDS caps 2 workgroups per CU, so **4 of
+16 possible waves per SIMD**.
+
+It cannot be fixed by tuning `mmq_y`, and here is the reason the Y sweep kept
+finding nothing. On the AMD WMMA path `nwarps = DS4_ROCM_WMMA_MMQ_Y / 16`, so
+waves per CU is `(LDS-limited workgroups) x nwarps` and the two factors scale
+with `mmq_y` in **opposite** directions:
+
+| `mmq_y` | weight tile | LDS | workgroups/CU | nwarps | waves/CU |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 9,728 B | ~15.5 KiB | 4 | 2 | **8** |
+| 64 | 19,456 B | 30.8 KiB | 2 | 4 | **8** |
+| 128 | 38,912 B | ~60 KiB | 1 | 8 | **8** |
+
+The product is invariant. Raising it requires shrinking LDS *per row*, i.e. the
+76-int tile row, and that is closed by the hardware: 64 of those ints are 32
+K-elements held one byte each because `iu8` WMMA consumes `int32x4_t` of int8
+lanes, so packed 2-bit codes cannot reach the matrix core.
+
+So the remaining lever on these two kernels is not occupancy but **latency
+hiding at fixed occupancy** — prefetching the next K-block's weight tile into
+registers during the current tile's `mma`, the same recipe that gave the Qwen
+attention kernel 1.12-1.30x. That is surgery on vendored MMQ and is the largest
+single untried item in prefill.
+
+## Decode: 4x headroom, and it is not bandwidth
+
+Decode was untouched by this work and had never been priced. Active bytes per
+decoded token are `43 x (6 x 7.08 MB routed + 51.2 MB dense)` = **4.03 GB**,
+giving a DRAM-bound ceiling of **60 tok/s** at 242 GB/s.
+
+Measured: **15.30 tok/s** (steady 15.31, `pp2048` + `tg128`), i.e. 61.7 GB/s or
+**25.5% of peak**. Decode has roughly **4x** theoretical headroom and is not
+memory-bound.
+
+A kernel trace of 64 decoded tokens shows why it will not yield to a single
+fix: **~1,560 dispatches per token** and no kernel above about 12% of decode.
+
+| Decode kernel | ms / 64 tok | calls | us/call |
+| --- | ---: | ---: | ---: |
+| `matmul_q8_0_hc_expand_preq_rows_w32` | 648 | 5,504 | 118 |
+| `matmul_q8_0_preq_rows_w32` | 591 | 2,817 | 210 |
+| `moe_gate_up_mid_decode_lut_qwarp32` | 509 | 2,752 | 185 |
+| `grouped_q8_0_a_preq_warp8` | 436 | 2,752 | 159 |
+| `matmul_f16_pair_f32_sharedx_warp_rows_w32` | 360 | 3,968 | 91 |
+| `matmul_q8_0_pair_preq_warp8` | 343 | 5,504 | 62 |
+| `attention_decode_mixed_one_fast_oldhip` | 305 | 2,752 | 111 |
+
+At the ~2 us dispatch floor on this GPU, 1,560 dispatches is ~3.1 ms per token,
+a 320 tok/s ceiling — so dispatch alone is not the binder at 15 tok/s, but the
+shape of the problem is many small launches each too short to saturate anything.
+The direction is fusion and wider per-launch work, not a hotspot fix. This is
+now the largest opportunity in the model, prefill included.
+
+### Where the prefill time now is
 
 Per-frontier kernel budget at the retained commit, from a two-chunk trace halved.
 The measured phase is **99.8% GPU-busy**, so prefill is purely kernel-bound and
@@ -265,9 +347,10 @@ gain is now closed in both directions, and the attention seam is half-closed.
 | ID | Experiment | Predicted | Gate |
 | :--- | :--- | --- | --- |
 | `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 931 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything. Now the largest unexamined kernel | Unknown; a counter read either opens or closes it | n/a, measurement only |
-| `ds4-x02-moe-roofline-analytic` | The inherited "both MoE matmuls are bandwidth-bound at ~27 and ~30 FLOP/byte" verdict covers **53% of the frontier** and has never been verified on this branch. PMC is blocked (`ds4-x01`), so get the bytes analytically: instrument one `fprintf` of the routed dims (`n_expert`, `n_expert_used`, `inter_dim`, `n_embd`), then divide by the trace durations already collected. There is a reason to doubt the verdict — `speed-bench/gb10.csv` shows 825-899 t/s at the same 2,048 chunk, 2.2x ours, on a platform with **273 GB/s against our 242**. Two systems at the same memory bandwidth cannot differ 2.2x if both are memory-bound | Decides whether 4,052 ms per frontier has headroom or is closed | Measurement only; one `fprintf` build |
+| `ds4-tg01-decode-fusion` | **Largest opportunity in the model.** Decode runs at 25.5% of the DRAM ceiling with ~1,560 dispatches per token and no kernel above 12%. Fuse the per-layer decode chain — `hc_expand_preq`, `q8_preq_rows`, `grouped_a_preq`, `pair_preq` are seven-plus launches per layer, several of them 60-120 us, i.e. too short to saturate. Start by counting launches per layer and merging the ones sharing an activation | 15.3 -> plausibly 25-35 tok/s; ceiling is 60 | Greedy equality per prompt; decode is currently bit-identical to baseline so any change must re-establish that |
+| `ds4-m03-mmq-kloop-prefetch` | IQ2 gate/up and dense Q8 are **29% of the frontier** at 13-23% of bandwidth and 14-16% of compute, with occupancy structurally pinned at 4 waves/SIMD (see the roofline section). The remaining lever is latency hiding at fixed occupancy: prefetch the next K-block's weight tile into registers during the current tile's `mma`, as `opt-c178-attn-prefetch` did for Qwen attention at 1.12-1.30x | -200 to -500 ms per frontier | Bit-identical by construction if the staged bytes and mma order are untouched; surgery on vendored MMQ, so build against the parity suite first |
 | `ds4-a07-mixed32-lds` | `attention_mixed_heads32_wmma` is still one workgroup per CU at 58,368 B, of which `q_half` is 33,024. Two workgroups needs 32,768 B total, which is unreachable while a block owns 32 heads. The prior 16-head split was measured at 1,428 -> 2,305 ms, so this needs a different decomposition, not a smaller one | Unknown; likely closed | — |
-| `ds4-m02-moe-64-row-tile` | The two MoE matmuls remain the **only** kernels that scale sub-linearly with chunk width: per token per layer, IQ2 gate/up costs 12.58 us at a 4,096-token chunk against 10.52 us at 8,192 (**-16.4%**), and Q2 down 10.68 against 9.46 (**-11.5%**); everything else is flat to within 1%. `ds4-m01` proved it is not column-tile fill, so it is the 64-row destination granularity and per-tile activation amortisation | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if the tail arithmetic is unchanged |
+| `ds4-m02-moe-64-row-tile` | The two MoE matmuls are still the only kernels that scale sub-linearly with chunk width: per token per layer IQ2 gate/up costs 12.58 us at a 4,096-token chunk against 10.52 at 8,192 (-16.4%), Q2 down 10.68 against 9.46 (-11.5%). `ds4-m01` proved it is not column-tile fill, so it is the 64-row destination granularity and per-tile activation amortisation | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if the tail arithmetic is unchanged |
 | `ds4-q01-repack-iq2` | Row-pair-interleaved 64 B-aligned IQ2 repack, the last untried fork idea. Removes 2-byte-aligned split loads | Unknown | Exact hashes; in place, no extra resident bytes |
 | `ds4-b01-blas-candidates` | The pinned hipBLASLt candidates (4/5/6) were chosen for determinism, not speed. Sweep the index and allow non-zero workspace | **Closed by the harness**: candidate 4 is within 4% of the best zero-workspace candidate on every shape, and a 64 MiB workspace unlocks no new solution — every candidate reports `workspaceSize = 0` | Closed |
 
