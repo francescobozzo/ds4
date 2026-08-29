@@ -454,6 +454,62 @@ matmul_f16_ordered_chunks -> router_select_warp_topk
 q8_K_quantize -> moe_gate_up_mid_decode_lut -> moe_down_sum6
 ```
 
+## Decode byte reduction: the precision budget, and where it can be spent
+
+Decode's remaining headroom is byte reduction (~1.7x to the 26.6 tok/s ceiling),
+which means spending precision. Budget adopted for any such change, tighter than
+the envelope this project already accepted for its own drift:
+
+1. Argmax unchanged at the 2K and 4K frontiers.
+2. Greedy `temp=0` continuation byte-identical for a fixed prompt.
+3. Teacher-forced NLL within **0.5%** of baseline.
+4. Zero non-finite and zero null logits.
+5. Top-20 overlap at least 19/20.
+
+Decode reads ~9.1 GB per token. By weight class:
+
+| Class | GB/token | Share | bpw | Headroom |
+| --- | ---: | ---: | ---: | --- |
+| routed gate/up IQ2_XXS | 1.12 | 12.3% | 2.06 | **none** — already near the floor |
+| routed down Q2_K | 0.71 | 7.8% | 2.63 | **none** |
+| dense projections Q8_0 | **2.20** | **24.2%** | **8.50** | **the only fat in the model** |
+| attention / KV / head / other | 5.07 | 55.7% | mixed | see below |
+
+Three candidate levers were checked and eliminated without spending any
+precision:
+
+- **The Q8-derived F16 weight caches are prefill-only.** Decode already reads
+  attention output B as Q8_0 directly (`matmul_q8_0_preq_rows_w32`, 35.7 MB per
+  call at 170 GB/s, 70% of peak), so there is no F16-to-Q8 saving to take.
+- **The compressed-KV F16 mirror buys nothing in decode.** `comp_kv` for a 2K
+  context is about 1 MB, entirely MALL-resident, which is why 64 heads re-reading
+  it costs only 4.79 ms per token. Halving it halves almost nothing. The decode
+  paths explicitly reject `comp_kv_f16` today and there is no reason to change
+  that.
+- **The routed streams have nothing to give**: 2.06 and 2.63 bpw already.
+
+**So the entire decode precision budget lives in one place: the dense Q8_0
+projections at 8.5 bpw.** The artifact name says the choice was deliberate —
+`...-AProjQ8-SExpQ8-OutQ8-...` — so these are the A-projection, shared-expert and
+output tensors, held at Q8 while the routed experts went to 2 bits.
+
+| Requantization | Bytes saved | Decode if perfectly memory-bound |
+| --- | ---: | ---: |
+| Q8_0 -> Q5_K (5.5 bpw) | -0.78 GB/token, **-9%** | ~16.7 tok/s (**+9%**) |
+| Q8_0 -> Q4_K (4.5 bpw) | -1.04 GB/token, **-11%** | ~17.3 tok/s (**+13%**) |
+
+**This is an artifact change, not a kernel change**, which is the important
+finding. It is produced with `tools/quant`, and the vendored MMQ already carries
+`load_tiles` and `vec_dot` for Q4_K and Q5_K and already routes them
+(`ds4_mmq.cu:426`, `:464`). The only kernel work is a dense entry point per type
+alongside the existing `ds4_mmq_q8_0_dense` and `ds4_mmq_q2_K_dense` wrappers.
+
+Sequencing that follows: requantize a candidate GGUF, gate it against the five
+criteria above **before** any kernel plumbing, because if Q5_K on the A-projection
+fails the NLL bound then the whole direction is closed and no kernel work was
+wasted. The model author put those three tensors at Q8 deliberately, so treat a
+failure there as the expected outcome, not a surprise.
+
 ### Where the prefill time now is
 
 Per-frontier kernel budget at the retained commit, from a two-chunk trace halved.
