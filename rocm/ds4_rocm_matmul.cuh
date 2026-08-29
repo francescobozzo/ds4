@@ -806,6 +806,18 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         const uint32_t rows_per_block = cfg->q8_decode_rpb;
+        if (cuda_dense_q4_enabled()) {
+            const unsigned char *w4 = cuda_q8_to_q4_ptr(
+                model_map, weight_offset, weight_bytes, in_dim, out_dim);
+            if (w4) {
+                matmul_q4_0_preq_rows_w32_kernel<<<
+                        ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                        rows_per_block * 32u>>>(
+                        (float *)out->ptr, w4, xq, xscale,
+                        in_dim, out_dim, blocks, rows_per_block);
+                return cuda_ok(cudaGetLastError(), "matmul_q4_0 rows launch");
+            }
+        }
         matmul_q8_0_preq_rows_w32_kernel<<<
                 ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
                 rows_per_block * 32u>>>(

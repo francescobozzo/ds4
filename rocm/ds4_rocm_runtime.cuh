@@ -562,6 +562,15 @@ __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         uint64_t in_dim,
         uint64_t out_dim,
         uint64_t blocks);
+/* Q4_0 block geometry and the requantizer; defined in ds4_rocm_q8.cuh, which is
+ * included after this file. */
+#define DS4_Q4_0_BLOCK_BYTES 18u
+__global__ static void requantize_q8_0_to_q4_0_kernel(
+        unsigned char *out,
+        const unsigned char *w,
+        uint64_t blocks,
+        uint64_t total_blocks);
+
 /* Tile geometry for dequant_q8_0_to_f16_transpose_tiled_kernel; see its
  * definition in ds4_rocm_q8.cuh for why the transpose is tiled. */
 #define DS4_Q8_T_TILE_I 32u
@@ -5111,6 +5120,68 @@ static const __half *cuda_q8_f16_ptr(
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
+    return dev;
+}
+
+/* Q4_0 requantized copies of dense Q8_0 weights, keyed by model offset, built
+ * once on first use. Costs 4.5 bpw beside the mmap'd 8.5 bpw original; for the
+ * dense projections that is about 1.16 GiB resident on top of the existing
+ * 80.76 GiB, which is why it is opt-in. See the kernel comment for the gate. */
+struct cuda_q4_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes;
+    unsigned char *device_ptr;
+};
+static std::vector<cuda_q4_range> g_q4_ranges;
+static std::unordered_map<uint64_t, size_t> g_q4_by_offset;
+static uint64_t g_q4_bytes;
+
+static int cuda_dense_q4_enabled(void) {
+    static int checked = 0;
+    static int on = 0;
+    if (!checked) {
+        checked = 1;
+        on = g_rocm_gfx1151 && !g_quality_mode &&
+             cuda_env_present(getenv("DS4_ROCM_DENSE_Q4"));
+    }
+    return on;
+}
+
+static const unsigned char *cuda_q8_to_q4_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    auto it = g_q4_by_offset.find(offset);
+    if (it != g_q4_by_offset.end()) {
+        const cuda_q4_range &r = g_q4_ranges[it->second];
+        if (r.host_base == model_map && r.weight_bytes == weight_bytes) return r.device_ptr;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    uint64_t total_blocks = 0, out_bytes = 0;
+    if (in_dim == 0u || out_dim == 0u ||
+        !cuda_u64_mul_checked(out_dim, blocks, &total_blocks) ||
+        !cuda_u64_mul_checked(total_blocks, DS4_Q4_0_BLOCK_BYTES, &out_bytes)) {
+        return NULL;
+    }
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    if (!q8) return NULL;
+    unsigned char *dev = NULL;
+    if (cudaMalloc(&dev, (size_t)out_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    requantize_q8_0_to_q4_0_kernel<<<(unsigned)((total_blocks + 255u) / 256u), 256>>>(
+            dev, (const unsigned char *)q8, blocks, total_blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8->q4 requantize launch")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    g_q4_ranges.push_back({model_map, offset, weight_bytes, dev});
+    g_q4_by_offset[offset] = g_q4_ranges.size() - 1u;
+    g_q4_bytes += out_bytes;
     return dev;
 }
 

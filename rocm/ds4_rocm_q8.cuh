@@ -202,6 +202,86 @@ __global__ static void matmul_q8_0_preq_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* Q8_0 -> Q4_0 requantization, and a GEMV that consumes the result.
+ *
+ * Decode reads ~9.1 GB per token and every class is already near its floor
+ * except the dense projections, which the artifact holds at Q8_0 (8.5 bpw)
+ * while the routed experts are at 2.06 and 2.63. Halving one dense stream is
+ * the only byte reduction available, and this kernel's stream is 1.57 GB per
+ * token at 70% of DRAM peak, i.e. genuinely memory-bound, so the saving should
+ * translate.
+ *
+ * Q4_0 block: one F16 scale then 16 bytes holding 32 nibbles, element j in the
+ * low nibble of byte j for j < 16 and the high nibble of byte j-16 otherwise,
+ * biased by -8. 18 bytes per 32 weights is 4.5 bpw against Q8_0's 8.5.
+ *
+ * This spends precision, so it is off unless DS4_ROCM_DENSE_Q4 is set and it is
+ * gated on: argmax unchanged at 2K/4K, greedy continuation byte-identical,
+ * teacher-forced NLL within 0.5%, no non-finite or null logits, top-20 >= 19/20. */
+__global__ static void requantize_q8_0_to_q4_0_kernel(
+        unsigned char *out,
+        const unsigned char *w,
+        uint64_t blocks,
+        uint64_t total_blocks) {
+    const uint64_t blk = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (blk >= total_blocks) return;
+    const unsigned char *src = w + blk * 34u;
+    unsigned char *dst = out + blk * DS4_Q4_0_BLOCK_BYTES;
+    const float d8 = __half2float(*(const __half *)src);
+    const int8_t *qs = (const int8_t *)(src + 2u);
+    /* Largest magnitude in the block sets the 4-bit scale, matching the
+     * reference Q4_0 rule: values map to [-8, 7] with a -8 bias. */
+    int amax = 0;
+    int vmax = 0;
+    for (uint32_t j = 0; j < 32u; j++) {
+        const int v = (int)qs[j];
+        const int a = v < 0 ? -v : v;
+        if (a > amax) { amax = a; vmax = v; }
+    }
+    const float d4 = (float)vmax / -8.0f;
+    const float inv = d4 != 0.0f ? 1.0f / d4 : 0.0f;
+    *(__half *)dst = __float2half(d8 * d4);
+    for (uint32_t j = 0; j < 16u; j++) {
+        const float x0 = (float)qs[j] * inv;
+        const float x1 = (float)qs[j + 16u] * inv;
+        uint32_t n0 = (uint32_t)fminf(15.0f, floorf(x0 + 8.5f));
+        uint32_t n1 = (uint32_t)fminf(15.0f, floorf(x1 + 8.5f));
+        dst[2u + j] = (unsigned char)(n0 | (n1 << 4u));
+    }
+    (void)blocks;
+}
+
+__global__ static void matmul_q4_0_preq_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t rows_per_block) {
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * DS4_Q4_0_BLOCK_BYTES;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * DS4_Q4_0_BLOCK_BYTES;
+        const float d = __half2float(*(const __half *)blk);
+        const unsigned char *q = blk + 2u;
+        const int8_t *xqb = xq + b * 32u;
+        int dot = 0;
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint32_t packed = q[j];
+            dot += (int)((packed & 0x0Fu) - 8u) * (int)xqb[j];
+            dot += (int)((packed >> 4u) - 8u) * (int)xqb[j + 16u];
+        }
+        acc += d * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
         float *out0,
         float *out1,

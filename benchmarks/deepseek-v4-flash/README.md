@@ -215,6 +215,7 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-tg04-dense-q4` | Spend the decode precision budget where the byte analysis says it is the only fat: requantize the dense Q8_0 projections to Q4_0 (8.5 -> 4.5 bpw) in a device cache keyed by model offset, and add a Q4_0 GEMV beside `matmul_q8_0_preq_rows_w32`. Implemented behind `DS4_ROCM_DENSE_Q4`, default off | **Implemented and measured: decode 15.273 -> 16.293 t/s, +6.7%**, three interleaved pairs, 3/3 positive. **Fails the budget on two of five criteria.** Teacher-forced NLL 4313.670 -> 4273.039, a **-0.94%** move (PPL 8.497 -> 8.327) against a +-0.5% band; the direction is favourable but the magnitude is the point — a 2% perplexity swing on one text from 4-bit weights is evidence the change is material, not safe, and another text could move the other way. Greedy `temp=0` diverges after four tokens: "Paris. It is **the largest city in France, situated on**" against the baseline's "**located in the north-central part of the**". Zero non-finite and zero null logits; the 2K/4K frontier envelope is unaffected because this path is decode-only. Also costs ~1.16 GiB resident beside the mmap'd Q8 original, and moves first-token latency 64.6 -> 130-160 ms for the one-time requantize | **Retained behind a default-off flag; the trade is refused by the budget** |
 | `ds4-m02-width-buckets-sized` | The one live route left on m02 was per-expert width bucketing. Rather than build it, measure the distribution it depends on: dump the per-expert token counts once and compute the padded-column total at a single width against the best per-expert width, holding the pass count fixed | **Quantified at +0.5% prefill, which does not justify the change.** At a 4,096-token chunk: 256 experts, 24,576 assignments, mean 96, max 455, bins `<24/<48/<80/<160/<240/<400/>=400` = `0/18/104/112/13/8/1`. Padded columns are 34,000 at x=80 (**72.3% fill**) against 30,160 for the best per-expert width (**81.5%**), so bucketing removes **11.3%** of padding. Padding enters only through the activation term, 21% of the kernel by ablation, so the gain is ~2.4% of the IQ2 kernel = **-52 ms per frontier**. Against three width-templated launches plus per-bucket bounds maps, that is a poor trade. It also explains the uniform `x=48` loss: padding fell 11% but passes rose 425 -> **640, +51%**, and passes are the 66% term | **Rejected on sizing** |
 | `ds4-tg03-q8-align` | Row groups and the epilogue were both ruled out, leaving the 34-byte Q8_0 block stride: `wr + b*34 + 2` rotates through every 4-byte alignment, so each dp4a `int32` read is unaligned — the defect the worklog documents for the 66-byte IQ2 and 84-byte Q2_K strides. Before scoping an aligned repack as multi-day work, ablate it: force the code pointer to a 4-byte boundary, same bytes touched and same request count, wrong data | **Rejected, +0.13% — noise.** Alignment is not the cost, which **closes the aligned-repack direction** for this kernel at a measured ceiling of ~0.1% and saved scoping it as a rewrite. More important, the three null results forced re-deriving the premise: `out_dim` here is `n_embd = 4096`, not the 2048 I had assumed, because the kernel writes `out_hc[dst_hc * n_embd + d]`. The call therefore moves **17.8 MB, not 8.9**, and runs at **151 GB/s = 63% of peak** — in line with its siblings. There was never a 2x in it; my "31% of peak, largest inefficiency in the model" was a byte-accounting error | **Rejected; premise corrected** |
 | `ds4-tg02-hc-epilogue-lanes` | `matmul_q8_0_hc_expand_preq_rows_w32` is the largest decode item, 10.12 ms/token at 31% of peak, and its GEMV reads only 136 B per wave — so the cost is not the matmul. The epilogue ran entirely on lane 0: an `n_hc` x `n_hc` walk with every `residual_hc` read and `out_hc` write issued by one lane, eight *dependent* single-lane global accesses per output row with 31 lanes idle. At ~1,000 cycles a miss that is ~8,000 cycles per row, the right order for 117.7 us per call. Give each `dst_hc` its own lane so the four `residual_hc` addresses are requested concurrently | **Retained, but far smaller than predicted: decode 15.230 -> 15.300 t/s, +0.46%**, three interleaved pairs, 3/3 positive. That implies the kernel improved only ~3%, not the 2-3x the latency arithmetic suggested, so the serialized epilogue was *not* dominant either. With row groups (`ds4-tg01-hc-decode-rpb`) and the epilogue both ruled out, the residual 31% points at the 34-byte Q8_0 block stride leaving every `int32` code read 2-byte aligned — an aligned repack, not a scheduling fix. **Bit-exact and proven so**: teacher-forced `nll=4313.670028443` is identical to baseline to every digit | **Retained** |
@@ -504,11 +505,20 @@ finding. It is produced with `tools/quant`, and the vendored MMQ already carries
 (`ds4_mmq.cu:426`, `:464`). The only kernel work is a dense entry point per type
 alongside the existing `ds4_mmq_q8_0_dense` and `ds4_mmq_q2_K_dense` wrappers.
 
-Sequencing that follows: requantize a candidate GGUF, gate it against the five
-criteria above **before** any kernel plumbing, because if Q5_K on the A-projection
-fails the NLL bound then the whole direction is closed and no kernel work was
-wasted. The model author put those three tensors at Q8 deliberately, so treat a
-failure there as the expected outcome, not a surprise.
+**This has now been implemented and gated, at Q4_0 rather than Q5_K**, using a
+load-time requantized device cache so no new artifact was needed
+(`ds4-tg04-dense-q4`). It delivers the predicted throughput — **+6.7% decode**
+against a +9-11% paper estimate — and **fails the budget**: NLL moves 0.94%
+against a 0.5% band and the greedy continuation diverges after four tokens. The
+author's choice of Q8 for these three tensors looks deliberate and correct.
+
+The lever is left in place behind `DS4_ROCM_DENSE_Q4`, default off, so the trade
+can be taken deliberately by whoever owns the quality bar. The obvious next step
+if someone wants it is **Q5_0 rather than Q4_0**: 5.5 bpw keeps about half the
+saving (~+3-4% decode) at materially less error, and the same cache and GEMV
+structure applies with an 18 -> 22 byte block. Q4_0 was chosen here because it is
+the simplest correct quantizer and therefore the fastest way to get a verdict on
+whether the direction is viable at all.
 
 ### Where the prefill time now is
 
