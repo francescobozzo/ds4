@@ -359,34 +359,76 @@ CUDA-only D2R path — cuts padding without raising LDS for the small buckets.
 That is the retained recommendation for `ds4-m02`, and it is a change to the
 routed launch path rather than to the kernel.
 
-## Decode: 4x headroom, and it is not bandwidth
+## Decode, priced properly
 
-Decode was untouched by this work and had never been priced. Active bytes per
-decoded token are `43 x (6 x 7.08 MB routed + 51.2 MB dense)` = **4.03 GB**,
-giving a DRAM-bound ceiling of **60 tok/s** at 242 GB/s.
+Decode was untouched by this work. A first pass computed active bytes per token
+as `43 x (6 x 7.08 MB routed + 51.2 MB dense)` = 4.03 GB, giving a 60 tok/s
+ceiling against a measured **15.30 tok/s** and suggesting ~4x headroom.
 
-Measured: **15.30 tok/s** (steady 15.31, `pp2048` + `tg128`), i.e. 61.7 GB/s or
-**25.5% of peak**. Decode has roughly **4x** theoretical headroom and is not
-memory-bound.
+**That 4x is not real, and the per-kernel numbers are why.** A trace of 64
+decoded tokens, aggregated over the last 10% of the run so it is steady state,
+gives 66.9 ms per token, **62.71 ms of it GPU-busy (94%)**, across **1,564
+dispatches per token**:
 
-A kernel trace of 64 decoded tokens shows why it will not yield to a single
-fix: **~1,560 dispatches per token** and no kernel above about 12% of decode.
+| ms/token | launches/token | us/call | kernel |
+| ---: | ---: | ---: | --- |
+| 10.12 | 86 | 117.7 | `matmul_q8_0_hc_expand_preq_rows_w32` |
+| 9.24 | 44 | 210.0 | `matmul_q8_0_preq_rows_w32` |
+| 7.97 | 43 | 185.4 | `moe_gate_up_mid_decode_lut_qwarp32` |
+| 6.82 | 43 | 158.6 | `grouped_q8_0_a_preq_warp8` |
+| 5.62 | 62 | 90.7 | `matmul_f16_pair_f32_sharedx_warp_rows_w32` |
+| 5.36 | 86 | 62.3 | `matmul_q8_0_pair_preq_warp8` |
+| 4.79 | 43 | 111.5 | `attention_decode_mixed_one_fast_oldhip` |
+| 3.80 | 43 | 88.4 | `moe_down_sum6_qwarp32` |
+| 3.65 | 130 | 28.1 | `matmul_f16_ordered_chunks` |
+| 0.37 | 259 | 1.4 | `quantize_q8_0_f32` |
+| **62.71** | **1,564** | | **total GPU-busy** |
 
-| Decode kernel | ms / 64 tok | calls | us/call |
+Priced against their *own* byte counts, the largest consumers are already
+efficient:
+
+| Kernel | bytes/call | GB/s | % of 242 |
 | --- | ---: | ---: | ---: |
-| `matmul_q8_0_hc_expand_preq_rows_w32` | 648 | 5,504 | 118 |
-| `matmul_q8_0_preq_rows_w32` | 591 | 2,817 | 210 |
-| `moe_gate_up_mid_decode_lut_qwarp32` | 509 | 2,752 | 185 |
-| `grouped_q8_0_a_preq_warp8` | 436 | 2,752 | 159 |
-| `matmul_f16_pair_f32_sharedx_warp_rows_w32` | 360 | 3,968 | 91 |
-| `matmul_q8_0_pair_preq_warp8` | 343 | 5,504 | 62 |
-| `attention_decode_mixed_one_fast_oldhip` | 305 | 2,752 | 111 |
+| `moe_down_sum6` (6 experts, Q2_K) | 16.5 MB | 187 | **77%** |
+| `matmul_q8_0_preq_rows` (32768x1024 Q8) | 35.7 MB | 170 | **70%** |
+| `moe_gate_up_mid_decode_lut` (6 experts, IQ2) | 26.0 MB | 140 | **58%** |
+| `grouped_q8_0_a_preq` | 17.8 MB | 112 | 46% |
+| `matmul_q8_0_hc_expand_preq` | 8.9 MB | 76 | 31% |
 
-At the ~2 us dispatch floor on this GPU, 1,560 dispatches is ~3.1 ms per token,
-a 320 tok/s ceiling — so dispatch alone is not the binder at 15 tok/s, but the
-shape of the problem is many small launches each too short to saturate anything.
-The direction is fusion and wider per-launch work, not a hotspot fix. This is
-now the largest opportunity in the model, prefill included.
+So the MoE weight streams — the bulk of the 4.03 GB — run at 58-77% of peak, not
+25%. The aggregate 25% and the per-kernel 58-77% cannot both be right against the
+same byte model, so **the 4.03 GB figure undercounts what decode actually
+reads**; the likely cause is dense and attention weights being re-read across
+the many mid-tier launches. Resolving that discrepancy is the prerequisite for
+any decode work, and it is a measurement, not a rewrite.
+
+Two candidate directions were checked and one is already dead:
+
+- **Fusing the activation quantization is not worth it.** `quantize_q8_0_f32` is
+  259 launches per token and only **0.37 ms**, 1.4 us each, i.e. already at the
+  dispatch floor. Removing all of it buys 0.6%.
+- The remaining headroom is in the mid-tier kernels at 31-46% of peak
+  (`matmul_q8_0_hc_expand_preq` at 10.12 ms/token is the largest single item in
+  decode) and in the 1,564 launches, which at the ~2 us dispatch floor is ~3.1 ms
+  per token of pure overhead, about 5%.
+
+Per-layer launch chain, for reference when looking for merges:
+
+```
+quantize_q8_0 -> matmul_q8_0_pair_preq -> swiglu
+quantize_q8_0 -> matmul_q8_0_hc_expand_preq -> rms_norm_plain
+matmul_f16_ordered_chunks -> hc_split_weighted_sum_norm_fused
+quantize_q8_0 -> matmul_q8_0_pair_preq -> dsv4_qkv_rms_norm_rows -> rope_tail
+quantize_q8_0 -> matmul_q8_0_preq_rows -> head_rms_norm_rope_tail_lds
+fp8_kv_quantize -> store_raw_kv_batch
+matmul_f16_pair_f32_sharedx -> compressor_store   (x2)
+attention_decode_mixed_one_fast -> rope_tail
+quantize_q8_0 -> grouped_q8_0_a_preq
+quantize_q8_0 -> matmul_q8_0_hc_expand_preq -> rms_norm_plain
+matmul_f16_ordered_chunks -> hc_split_weighted_sum_norm_fused
+matmul_f16_ordered_chunks -> router_select_warp_topk
+q8_K_quantize -> moe_gate_up_mid_decode_lut -> moe_down_sum6
+```
 
 ### Where the prefill time now is
 
@@ -418,7 +460,7 @@ gain is now closed in both directions, and the attention seam is half-closed.
 | ID | Experiment | Predicted | Gate |
 | :--- | :--- | --- | --- |
 | `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 931 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything. Now the largest unexamined kernel | Unknown; a counter read either opens or closes it | n/a, measurement only |
-| `ds4-tg01-decode-fusion` | **Largest opportunity in the model.** Decode runs at 25.5% of the DRAM ceiling with ~1,560 dispatches per token and no kernel above 12%. Fuse the per-layer decode chain — `hc_expand_preq`, `q8_preq_rows`, `grouped_a_preq`, `pair_preq` are seven-plus launches per layer, several of them 60-120 us, i.e. too short to saturate. Start by counting launches per layer and merging the ones sharing an activation | 15.3 -> plausibly 25-35 tok/s; ceiling is 60 | Greedy equality per prompt; decode is currently bit-identical to baseline so any change must re-establish that |
+| `ds4-tg01-decode-bytes` | **Premise corrected, see the decode section.** The MoE weight streams already run at 58-77% of peak, so the 4x implied by a 4.03 GB/token model is not there and the model itself undercounts. Before any fusion: reconcile measured per-kernel bytes against the 4.03 GB estimate to find the redundant traffic. Then the targets are the mid-tier kernels at 31-46% of peak — `matmul_q8_0_hc_expand_preq_rows_w32` is 10.12 ms/token, the single largest item in decode — and the 1,564 launches/token, worth ~5% at the dispatch floor. Fusing `quantize_q8_0_f32` is already dead: 259 launches for 0.37 ms | Unknown until the byte model is reconciled; not the 60 tok/s first claimed | Decode is currently bit-identical to baseline; any change must re-establish that |
 | `ds4-m03-mmq-kloop-prefetch` | **Closed by measurement.** Weight prefetch is capped at +2.6% of prefill by ablation, and the activation prefetch that the ablations recommended measured +30.6% on the IQ2 kernel. See the two entries in the log. What remains on these kernels is the dequantization instruction path, not memory | Closed | — |
 | `ds4-a07-mixed32-lds` | `attention_mixed_heads32_wmma` is still one workgroup per CU at 58,368 B, of which `q_half` is 33,024. Two workgroups needs 32,768 B total, which is unreachable while a block owns 32 heads. The prior 16-head split was measured at 1,428 -> 2,305 ms, so this needs a different decomposition, not a smaller one | Unknown; likely closed | — |
 | `ds4-m02-moe-width-buckets` | **Diagnosed; see the sub-linearity section.** The mechanism is per-column-tile-pass overhead, 66% of the IQ2 kernel, and raising `mmq_x` to reduce passes is blocked by a 33,664 B LDS footprint that halves occupancy. The open route is bucketing experts by token count (`hot_max` 455 vs mean 96) and issuing one launch per width bucket | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if per-bucket accumulation order is unchanged |
