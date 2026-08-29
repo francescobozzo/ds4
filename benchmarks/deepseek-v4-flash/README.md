@@ -215,6 +215,7 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-m02-width-buckets-sized` | The one live route left on m02 was per-expert width bucketing. Rather than build it, measure the distribution it depends on: dump the per-expert token counts once and compute the padded-column total at a single width against the best per-expert width, holding the pass count fixed | **Quantified at +0.5% prefill, which does not justify the change.** At a 4,096-token chunk: 256 experts, 24,576 assignments, mean 96, max 455, bins `<24/<48/<80/<160/<240/<400/>=400` = `0/18/104/112/13/8/1`. Padded columns are 34,000 at x=80 (**72.3% fill**) against 30,160 for the best per-expert width (**81.5%**), so bucketing removes **11.3%** of padding. Padding enters only through the activation term, 21% of the kernel by ablation, so the gain is ~2.4% of the IQ2 kernel = **-52 ms per frontier**. Against three width-templated launches plus per-bucket bounds maps, that is a poor trade. It also explains the uniform `x=48` loss: padding fell 11% but passes rose 425 -> **640, +51%**, and passes are the 66% term | **Rejected on sizing** |
 | `ds4-tg03-q8-align` | Row groups and the epilogue were both ruled out, leaving the 34-byte Q8_0 block stride: `wr + b*34 + 2` rotates through every 4-byte alignment, so each dp4a `int32` read is unaligned — the defect the worklog documents for the 66-byte IQ2 and 84-byte Q2_K strides. Before scoping an aligned repack as multi-day work, ablate it: force the code pointer to a 4-byte boundary, same bytes touched and same request count, wrong data | **Rejected, +0.13% — noise.** Alignment is not the cost, which **closes the aligned-repack direction** for this kernel at a measured ceiling of ~0.1% and saved scoping it as a rewrite. More important, the three null results forced re-deriving the premise: `out_dim` here is `n_embd = 4096`, not the 2048 I had assumed, because the kernel writes `out_hc[dst_hc * n_embd + d]`. The call therefore moves **17.8 MB, not 8.9**, and runs at **151 GB/s = 63% of peak** — in line with its siblings. There was never a 2x in it; my "31% of peak, largest inefficiency in the model" was a byte-accounting error | **Rejected; premise corrected** |
 | `ds4-tg02-hc-epilogue-lanes` | `matmul_q8_0_hc_expand_preq_rows_w32` is the largest decode item, 10.12 ms/token at 31% of peak, and its GEMV reads only 136 B per wave — so the cost is not the matmul. The epilogue ran entirely on lane 0: an `n_hc` x `n_hc` walk with every `residual_hc` read and `out_hc` write issued by one lane, eight *dependent* single-lane global accesses per output row with 31 lanes idle. At ~1,000 cycles a miss that is ~8,000 cycles per row, the right order for 117.7 us per call. Give each `dst_hc` its own lane so the four `residual_hc` addresses are requested concurrently | **Retained, but far smaller than predicted: decode 15.230 -> 15.300 t/s, +0.46%**, three interleaved pairs, 3/3 positive. That implies the kernel improved only ~3%, not the 2-3x the latency arithmetic suggested, so the serialized epilogue was *not* dominant either. With row groups (`ds4-tg01-hc-decode-rpb`) and the epilogue both ruled out, the residual 31% points at the 34-byte Q8_0 block stride leaving every `int32` code read 2-byte aligned — an aligned repack, not a scheduling fix. **Bit-exact and proven so**: teacher-forced `nll=4313.670028443` is identical to baseline to every digit | **Retained** |
 | `ds4-m02-mmq-x-above-cap` | The sub-linearity diagnosis says 66% of the IQ2 kernel is per-column-tile-pass, and at 96 tokens per expert `x=80` needs two passes where `x=96` needs one. The HIP cap of 80 was made raisable so the whole range could be swept without a rebuild | **Rejected, as the LDS arithmetic predicted.** 8K, two rounds each: x=80 **404.8**, x=88 405.5 (+0.2%, noise), x=96 **398.7 (-1.5%)**, x=112 394.9, x=128 393.6. Halving the passes does not pay for halving occupancy: `x=96` takes LDS to 33,664 B, past the 32,768 B needed for two workgroups per CU. And the 1,024 B that would fix it cannot be freed — the `+4` in the 76-int tile row carries a `% 8 == 4` bank-offset static assert, so 72 is illegal, and the other 72 ints are real codes and scales. `x=96` is closed | **Rejected** |
@@ -355,13 +356,19 @@ crosses the 32,768 B needed for two workgroups per CU and **halves occupancy to
 kernel that trade is very likely negative, which is presumably why the HIP cap
 is 80.
 
-The route that is *not* blocked is per-expert width selection: `hot_max` is 455
-against an average of 96, so a single width is wrong for both ends of the
-distribution. Bucketing experts by token count and issuing one launch per width
-bucket — PR 887's tail-tile specialization, which it measured at +4.2% on the
-CUDA-only D2R path — cuts padding without raising LDS for the small buckets.
-That is the retained recommendation for `ds4-m02`, and it is a change to the
-routed launch path rather than to the kernel.
+Per-expert width selection was the remaining route, and it has now been **sized
+and rejected**. The measured distribution at a 4,096-token chunk is 256 experts,
+mean 96, max 455, with bins `<24/<48/<80/<160/<240/<400/>=400` =
+`0/18/104/112/13/8/1` — no tiny experts at all, and 216 of 256 between 48 and
+160. Padded columns are 34,000 at x=80 (72.3% fill) against 30,160 for the best
+per-expert width holding passes fixed (81.5%), so bucketing removes 11.3% of
+padding. Padding enters only via the activation term, 21% of the kernel, so the
+end result is ~2.4% of the IQ2 kernel, **-52 ms per frontier or +0.5% prefill**,
+for three width-templated launches and per-bucket bounds maps.
+
+This also closes the loop on the uniform `x=48` result: it cut padding by 11% but
+raised the pass count from 425 to 640, **+51%**, and passes are the 66% term.
+Nothing about the distribution favours a narrower width.
 
 ## Decode, priced properly
 
