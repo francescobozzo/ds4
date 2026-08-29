@@ -215,6 +215,7 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-tg03-q8-align` | Row groups and the epilogue were both ruled out, leaving the 34-byte Q8_0 block stride: `wr + b*34 + 2` rotates through every 4-byte alignment, so each dp4a `int32` read is unaligned — the defect the worklog documents for the 66-byte IQ2 and 84-byte Q2_K strides. Before scoping an aligned repack as multi-day work, ablate it: force the code pointer to a 4-byte boundary, same bytes touched and same request count, wrong data | **Rejected, +0.13% — noise.** Alignment is not the cost, which **closes the aligned-repack direction** for this kernel at a measured ceiling of ~0.1% and saved scoping it as a rewrite. More important, the three null results forced re-deriving the premise: `out_dim` here is `n_embd = 4096`, not the 2048 I had assumed, because the kernel writes `out_hc[dst_hc * n_embd + d]`. The call therefore moves **17.8 MB, not 8.9**, and runs at **151 GB/s = 63% of peak** — in line with its siblings. There was never a 2x in it; my "31% of peak, largest inefficiency in the model" was a byte-accounting error | **Rejected; premise corrected** |
 | `ds4-tg02-hc-epilogue-lanes` | `matmul_q8_0_hc_expand_preq_rows_w32` is the largest decode item, 10.12 ms/token at 31% of peak, and its GEMV reads only 136 B per wave — so the cost is not the matmul. The epilogue ran entirely on lane 0: an `n_hc` x `n_hc` walk with every `residual_hc` read and `out_hc` write issued by one lane, eight *dependent* single-lane global accesses per output row with 31 lanes idle. At ~1,000 cycles a miss that is ~8,000 cycles per row, the right order for 117.7 us per call. Give each `dst_hc` its own lane so the four `residual_hc` addresses are requested concurrently | **Retained, but far smaller than predicted: decode 15.230 -> 15.300 t/s, +0.46%**, three interleaved pairs, 3/3 positive. That implies the kernel improved only ~3%, not the 2-3x the latency arithmetic suggested, so the serialized epilogue was *not* dominant either. With row groups (`ds4-tg01-hc-decode-rpb`) and the epilogue both ruled out, the residual 31% points at the 34-byte Q8_0 block stride leaving every `int32` code read 2-byte aligned — an aligned repack, not a scheduling fix. **Bit-exact and proven so**: teacher-forced `nll=4313.670028443` is identical to baseline to every digit | **Retained** |
 | `ds4-m02-mmq-x-above-cap` | The sub-linearity diagnosis says 66% of the IQ2 kernel is per-column-tile-pass, and at 96 tokens per expert `x=80` needs two passes where `x=96` needs one. The HIP cap of 80 was made raisable so the whole range could be swept without a rebuild | **Rejected, as the LDS arithmetic predicted.** 8K, two rounds each: x=80 **404.8**, x=88 405.5 (+0.2%, noise), x=96 **398.7 (-1.5%)**, x=112 394.9, x=128 393.6. Halving the passes does not pay for halving occupancy: `x=96` takes LDS to 33,664 B, past the 32,768 B needed for two workgroups per CU. And the 1,024 B that would fix it cannot be freed — the `+4` in the 76-int tile row carries a `% 8 == 4` bank-offset static assert, so 72 is illegal, and the other 72 ints are real codes and scales. `x=96` is closed | **Rejected** |
 | `ds4-tg01-hc-decode-rpb` | `matmul_q8_0_hc_expand_preq_rows_w32` is the largest single decode item, 10.12 ms per token at **31% of peak** against a 37 us roofline for its 8.9 MB. At `out_dim=2048` the default row group of 32 gives 1024-thread workgroups and only **64 of them for 40 CUs**, i.e. 1.6 rounds with a poor tail. Grouping is bit-exact, so both Q8 decode row widths were exposed as tunables and swept | **Rejected: the default is already optimal.** Decode t/s, two rounds each: rpb 32 **15.26**, 16 15.27, 8 15.22, 4 15.11, 2 15.18. Not workgroup-count limited, so the 31% is elsewhere — most likely the 34-byte Q8_0 block stride leaving every `int32` code read 2-byte aligned, the same defect the worklog documents for the 66-byte IQ2 and 84-byte Q2_K strides. That needs an aligned repack, not a launch-geometry change. The two env knobs are retained as diagnostics with defaults unchanged | **Rejected** |
@@ -400,10 +401,23 @@ efficient:
 
 So the MoE weight streams — the bulk of the 4.03 GB — run at 58-77% of peak, not
 25%. The aggregate 25% and the per-kernel 58-77% cannot both be right against the
-same byte model, so **the 4.03 GB figure undercounts what decode actually
-reads**; the likely cause is dense and attention weights being re-read across
-the many mid-tier launches. Resolving that discrepancy is the prerequisite for
-any decode work, and it is a measurement, not a rewrite.
+same byte model, and **the byte model is what was wrong.**
+
+Closing it out: `matmul_q8_0_hc_expand_preq_rows_w32`, the largest single item,
+writes `out_hc[dst_hc * n_embd + d]`, so its `out_dim` is `n_embd = 4096` and it
+moves 17.8 MB per call, not the 8.9 MB first assumed — **151 GB/s, 63% of peak**.
+Working backwards from an average of ~145 GB/s across 62.71 ms of busy time,
+decode reads about **9.1 GB per token, not 4.03 GB**. The missing 5 GB is the
+attention path (`out_a`, `out_b`, Q/KV projections), the shared expert, the
+indexer, the LM head and KV-cache traffic, none of which the first estimate
+counted.
+
+**So the real decode ceiling is ~26.6 tok/s, not 60, and 15.30 is 57% of it.**
+There is roughly 1.7x of theoretical headroom, not 4x, and reaching it means
+reading *fewer bytes* — quantization or removing redundant reads — not faster
+kernels. Three separate attempts to make the largest kernel faster (row groups,
+epilogue lanes, alignment) returned +0%, +0.46% and +0.13%, which is what a
+63%-of-peak kernel should return.
 
 Two candidate directions were checked and one is already dead:
 
