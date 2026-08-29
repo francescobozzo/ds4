@@ -228,7 +228,11 @@ __global__ static void indexer_scores_wmma128_kernel(
                 acc[slot] += fmaxf(c_sh[i], 0.0f) * w0;
             }
         }
-        __syncthreads();
+        /* No barrier here. The next head writes `c_sh` only after its own
+         * post-staging barrier, which already orders every thread's reads above
+         * against that write, and it writes `a_sh`, a different array. The
+         * epilogue below reads only registers. Dropping this saves one barrier
+         * of three per head, 64 heads per workgroup. */
     }
 
     uint32_t slot = 0;

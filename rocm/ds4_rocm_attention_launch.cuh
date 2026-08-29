@@ -371,24 +371,11 @@ static int attention_decode_batch_launch(
     if (!use_comp_mask && !g_quality_mode && g_rocm_gfx1151 &&
         n_tokens >= 128u && n_comp != 0u && n_head == 64u &&
         head_dim == 512u && window <= 256u) {
-        float *wmma_score_cache = NULL;
-        uint32_t wmma_score_stride = 0u;
-        const uint64_t stride64 =
-            (uint64_t)DS4_ROCM_ATTENTION_RAW_SCORE_CAP + n_comp;
-        uint64_t score_bytes = 0u;
-        if (stride64 <= UINT32_MAX &&
-            cuda_u64_mul3_checked(
-                n_tokens,
-                (uint64_t)n_head * stride64,
-                sizeof(float),
-                &score_bytes) &&
-            score_bytes <= (1ull << 30u)) {
-            wmma_score_cache = (float *)cuda_tmp_alloc(
-                score_bytes, "mixed attention WMMA scores");
-            if (wmma_score_cache) {
-                wmma_score_stride = (uint32_t)stride64;
-            }
-        }
+        /* The single-pass kernel visits each KV row block once, so the score
+         * cache that let the old second pass skip its QK matrix multiply has no
+         * reader. It cost up to 1 GiB of the shared scratch buffer. */
+        float *const wmma_score_cache = NULL;
+        const uint32_t wmma_score_stride = 0u;
         const dim3 grid(n_tokens, n_head / 32u, 1u);
         attention_mixed_heads32_wmma_kernel<false, false><<<grid, 1024>>>(
             (float *)heads->ptr,
@@ -415,8 +402,7 @@ static int attention_decode_batch_launch(
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
                     "mixed-window prefill using wave32 rocWMMA "
-                    "(token=1, heads=32, rows=16, score-cache=%s)\n",
-                    wmma_score_cache ? "on" : "off");
+                    "(token=1, heads=32, rows=16, single-pass)\n");
             notice_printed = 1;
         }
         return cuda_ok(
@@ -595,44 +581,18 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return cuda_ok(cudaGetLastError(), "attention indexed decode oldhip fast launch");
     }
-    float *wmma_score_cache = NULL;
-    uint32_t wmma_score_stride = 0u;
+    /* No reader since the kernel became single-pass; see the sibling launcher. */
+    float *const wmma_score_cache = NULL;
+    const uint32_t wmma_score_stride = 0u;
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
         const uint64_t sort_aligned = (sort_bytes + 255u) & ~255ull;
         uint64_t tmp_bytes = sort_aligned;
-        const int want_score_cache =
-            !g_quality_mode && g_rocm_gfx1151 &&
-            n_tokens >= 128u && n_head == 64u && window <= 256u;
-        if (want_score_cache) {
-            const uint32_t stride =
-                DS4_ROCM_ATTENTION_RAW_SCORE_CAP + top_k;
-            uint64_t score_bytes = 0u;
-            uint64_t combined_bytes = 0u;
-            if (cuda_u64_mul3_checked(
-                    n_tokens,
-                    (uint64_t)n_head * stride,
-                    sizeof(float),
-                    &score_bytes) &&
-                score_bytes <= (1ull << 30u) &&
-                cuda_u64_add_checked(
-                    sort_aligned, score_bytes, &combined_bytes)) {
-                wmma_score_stride = stride;
-                tmp_bytes = combined_bytes;
-            }
-        }
         char *scratch = (char *)cuda_tmp_alloc(
-            tmp_bytes, "indexed attention topk and WMMA scores");
-        if (!scratch && wmma_score_stride != 0u) {
-            wmma_score_stride = 0u;
-            scratch = (char *)cuda_tmp_alloc(
-                sort_bytes, "indexed attention topk sort");
-        }
+            tmp_bytes, "indexed attention topk sort");
         int32_t *sorted = (int32_t *)scratch;
         if (!sorted) return 0;
-        if (wmma_score_stride != 0u) {
-            wmma_score_cache = (float *)(scratch + sort_aligned);
-        }
+        (void)sort_aligned;
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
@@ -693,8 +653,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 fprintf(stderr,
                         DS4_GPU_LOG_PREFIX
                         "indexed prefill using wave32 rocWMMA "
-                        "(token=1, heads=32, rows=16, score-cache=%s)\n",
-                        wmma_score_cache ? "on" : "off");
+                        "(token=1, heads=32, rows=16, single-pass)\n");
                 notice_printed = 1;
             }
             return cuda_ok(

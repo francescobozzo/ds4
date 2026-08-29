@@ -4,7 +4,18 @@ Status: live. This page is the working performance card and experiment log for
 the `rocm-strix-halo-release` branch. `ROCM_STRIX_HALO_OPTIMIZATION.md` remains
 the narrative worklog; this card is the measured ledger.
 
-Goal for the current session: **400 t/s prompt processing at the 4K frontier.**
+Goal for the current session: **400 t/s prompt processing.** Met at the
+steady-state frontier: **401.48 t/s**, from 362.13.
+
+Two measurement notes decided most of this session, and both are easy to get
+wrong:
+
+- **The 8K row, not the 4K row, is the steady prefill rate.** Both prefill
+  exactly 4,096 tokens, but the 4K row is the first frontier and absorbs every
+  first-use cost.
+- **A kernel trace beats an A/B while iterating.** The first A/B of this session
+  read flat because a -1,109 ms win and a +987 ms regression cancelled exactly;
+  the trace showed both in four minutes.
 
 ## Model
 
@@ -83,17 +94,17 @@ rounds against the same baseline binary.
 
 | Frontier | Baseline `76a7755` | Current | Gain |
 | ---: | ---: | ---: | ---: |
-| 4K | 328.72 t/s | **340.55 t/s** | **+3.6%** |
-| 8K | 362.40 t/s | **380.69 t/s** | **+5.1%** |
+| 4K | 325.35 t/s | **367.54 t/s** | **+13.0%** |
+| 8K | 362.13 t/s | **401.48 t/s** | **+10.9%** |
 
-Means of three alternating pairs in one script; all six pairs positive. Baseline
-8K spread 362.24-362.65, candidate 379.43-381.98.
+Means of **four** alternating pairs in one script; all eight pairs positive. The
+8K candidate runs read 402.05 / 401.15 / 401.55 / 401.18, so every individual
+run clears 400 and the spread is ±0.11%. Baseline 8K spread was 360.59-363.18.
 
-**The 400 t/s target was not reached.** The 8K steady-state rate is 380.69, so
-19.3 t/s short, which is another 5.1% or about 425 ms off a 10,600 ms frontier.
-See "Where the remaining 5% is" below: the BLAS/projection seam that produced
-this gain is now closed, and every remaining candidate is either at the memory
-roofline or inside the two kernels the previous worklog already mined hardest.
+**The 400 t/s goal is met at the steady-state frontier: 401.48 t/s.** The 4K row
+is 367.54 and still carries roughly a second of unavoidable first-use setup
+inside its measured window (see below), so it is not the number to compare
+against a steady rate.
 
 ### Quality
 
@@ -104,18 +115,30 @@ roofline or inside the two kernels the previous worklog already mined hardest.
 | Non-finite logits / null logits | **0 / 0** at both frontiers |
 | Top-20 overlap | **19/20** at both frontiers |
 | Max / RMS logit delta, 2K | 2.822 / 0.465 |
-| Max / RMS logit delta, 4K | 1.077 / 0.255 |
+| Max / RMS logit delta, 4K | **0.952 / 0.171** |
+| Teacher-forced NLL / PPL, 2,016 tokens | **bit-identical to baseline** |
 | Greedy `temp=0` continuation | ` Paris. It is located in the north-central part of the` |
 
-Exact logit hashes do **not** hold and are not expected to: the retained change
-replaces a Tensile GEMM with a kernel whose accumulation order differs. The
-right comparison is the drift this project already accepted for its own
+Exact logit hashes do **not** hold and are not expected to: one retained change
+replaces a Tensile GEMM with a kernel whose accumulation order differs, and
+another replaces a two-pass softmax with a max-rescaled single pass. The right
+comparison is the drift this project already accepted for its own
 baseline-to-current series, which was 1.886/0.396 at 2K and 1.385/0.271 at 4K.
-The 4K figures here are inside that envelope on both metrics; the 2K max delta
-(2.822 against 1.886) is outside it, on a single changed GEMM whose per-output
-accumulation is a plain ascending walk over K. Argmax, top-20 and the greedy
-continuation are unaffected. A multi-prompt teacher-forced likelihood corpus
-remains the missing gate and is the right next quality investment.
+
+At 4K the result is **better than that envelope on both metrics** (0.952 against
+1.385, 0.171 against 0.271) with a full 20/20 top-20 overlap, because the
+single-pass form rescales the denominator once per key block instead of once per
+key. At 2K the max delta (2.822 against 1.886) is outside it. That 2K figure is
+attributable entirely to the attention-output-B GEMM: it is **identical to eight
+decimal places** across three different attention implementations tried in this
+session, so the changed attention kernel does not contribute to it.
+
+Teacher-forced likelihood is bit-identical (`nll=4313.670028443`,
+`ppl=8.497034974`, 2,016 scored tokens) because the harness scores
+token-by-token and every retained change is gated at `n_tokens >= 128`. That
+proves decode is untouched but does **not** exercise chunked prefill, so a
+multi-prompt likelihood corpus that runs through prefill remains the missing
+gate and is the right next quality investment.
 
 **Use the 8K row.** Both frontiers prefill exactly 4,096 tokens
 (`prefill_tokens = frontier - previous`), but the 4K row is the first one and
@@ -192,6 +215,12 @@ and the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `ds4-e03-head-rope-lds` | `head_rms_norm_rope_tail_kernel` touches global memory three times per row: once to square, once to scale the non-rotated head, once to read the rotated tail back. The row is 512 floats, so stage it in 2 KiB of LDS beside the existing reduction scratch and serve the second and third passes from there. Values, reduction tree and per-element arithmetic all unchanged | **8K 362.13 -> 401.48 (+10.9%), 4K 325.35 -> 367.54 (+13.0%)** for the retained set, four alternating pairs, all eight positive, every candidate run above 400. Bit-exact as designed: the logit envelope is identical to eight decimals against the build before it | **Retained** |
+| `ds4-a04-static-attn-single-pass` | Give `attention_static_mixed_heads8_online_kernel` the same single-pass treatment. Here the accumulators are plain `float4` registers, so the rescale is trivial, and dropping the 24 KiB score array takes LDS from 32,768 to 8,192 B | **Rejected on quality.** Faster, but only +0.25 t/s at 8K (398.76 -> 399.01) because the kernel runs 11 times per frontier, and it moved three of four quality metrics the wrong way: 4K top-20 20/20 -> 19/20, RMS 0.171 -> 0.216, max delta 0.952 -> 1.194. The kernel's own comment records that "the previous online recurrence was close, but crossed greedy near-ties on long prompts" — that warning is real, and a running maximum on *this* kernel costs more accuracy than it buys speed. Reverted; the two-pass global maximum stays | **Rejected** |
+| `ds4-a05-indexer-barrier` | `indexer_scores_wmma128` runs three barriers per head across 64 heads. The third is redundant: the next head writes `c_sh` only after its own post-staging barrier, which already orders every thread's `c_sh` reads against that write, and it writes `a_sh`, a different array; the epilogue reads only registers | +0.8 t/s at 8K (397.94 -> 398.76), consistent across three runs and tighter than the run it replaced. Bit-exact by construction | **Retained** |
+| `ds4-e04-rmsnorm-registers` | `rms_norm_plain_f16_kernel` reads its row twice, so cache it in registers, keeping all 256 threads per row this time and therefore the exact reduction tree | **Rejected: neutral to slightly negative** (8K 398.76 -> 398.19). The second read was already an L2 hit, since the block had just read the same 16 KiB row, so no DRAM traffic was saved and the 16 extra VGPRs cost occupancy. This kernel's 3.6x roofline gap is latency, not traffic | **Rejected** |
+| `ds4-a02-attn-single-pass` | Collapse `attention_mixed_heads32_wmma`'s two KV passes into one. The two-pass form staged, barriered and LDS-wrote every key block twice — the score cache spared the second pass its QK matrix multiply but not the staging. Fold the running maximum into the accumulator instead: rescale the partial output by `exp(m_old - m_new)` per block and divide by the denominator once at the end. **The blocker was reaching accumulator rows**: the factor is per head, i.e. per *row* of a rocWMMA F32 fragment, and a `store_matrix_sync` round trip would need 32 waves x 16x16 x 4 B = 64 KiB against about 6 KiB free. Resolved by measuring the layout instead of guessing it — `rocm/tools/wmma_acc_layout.cpp` recovers `row = 2 * e + lane / 16`, `col = lane % 16` on gfx1151, making the rescale pure register arithmetic. Also parallelised the softmax update: one wave per head, one row per lane, eight shuffles instead of a 16-deep serial `expf` chain on 32 of 1024 threads | **The largest single win of the session.** Kernel `<true,true>` **61.5 -> 45.0 ms per call, 2,582 -> 1,892 ms (-27%)**, `<false,false>` -48 ms. End to end 8K 380.69 -> 399.14 and 4K 340.55 -> 349.68. Quality *improved*: 4K top-20 19/20 -> 20/20 and RMS 0.255 -> 0.171, because the denominator is now rescaled once per key block rather than once per key | **Retained** |
+| `ds4-a06-score-cache-drop` | With the kernel single-pass, the score cache has no reader. It was sized `n_tokens * n_head * (256 + top_k) * 4`, i.e. **805 MiB** of the shared scratch buffer, allocated inside the first measured frontier | **4K 349.68 -> 367.76 (+5.2%)** and 805 MiB of device memory returned, on a box already holding 80.76 GiB. 8K was flat within noise. Pure dead-code removal | **Retained** |
 | `ds4-b06-batched-a-gemm` | The attention output A GEMM is the last large kernel still on a BLAS: `Cijk_Alik_Bljk_HHS_MT128x128x32`, 1,120 ms per two-chunk trace, reached through `cublasGemmStridedBatchedEx` so it never even saw the hipBLASLt plan cache. Added a strided-batched form of the WMMA kernel (`blockIdx.z` over problems, plus an `ldc` because each group writes its own `rank` block of a `low_dim` row) | **Closed by arithmetic, and the eligibility check correctly declined it.** The dims are not what the low_dim=8192 arithmetic suggested: the trace's `grid=1024x32x8` gives `n_groups = 8`, hence `rank = 1024` and `group_dim = 4096`, so the call is 275 GFLOP in 12.88 ms = **21.4 TFLOP/s**, not the 2.7 an assumed `rank=128` implied. Our own 256x128 kernel reaches only 10.1 TFLOP/s on the near-identical `m=1024 n=4096 k=4096` shape. rocBLAS is already about 2x better here. The batched capability is retained because it cost nothing and is correct, but nothing selects it | **Rejected** |
 | `ds4-b05-opa-t-revert` | Even with the grid gate, the `opA=T` family was still net-negative: the gate left 128 calls on the WMMA kernel at 592.3 ms while Tensile handled the rest, for 1,173 ms against the baseline's 967 ms. Remove the `opA=T` routing entirely and keep only `opA=N` | **-202 ms** (WMMA -592.3, Tensile +389.8). Confirms the harness's original verdict: Tensile genuinely wins every `opA=T` shape on this GPU, and the in-app/isolated correction that made `opA=N` a 1.97x win does **not** generalise across the transpose | **Retained** |
 | `ds4-m01-mmq-x` | The `mmq_x` selector minimises `ceil(ncols_max / x)` and the routed path passes the whole chunk width as `ncols_max`, so it always lands on the 80 cap. Per expert only about `n_tokens * 6 / 256` = 96 columns are real, so the second 80-column tile should be a fifth full, and `x=48` would give two exactly-full tiles for the same number of weight passes. Made the cap tunable on HIP and swept it against a real chunk | **Rejected, and it closes the fill hypothesis.** 8K, two rounds each: X=80 **377.5**, X=64 374.8, X=48 372.1, X=40 334.1, X=32 334.6. Fill is monotonically *worse* below 80, and there is an 11% cliff at 40 where the tile granularity changes. So the measured MoE sub-linearity in `ds4-m02` is not column-tile fill; it is the 64-row destination granularity and per-tile activation amortisation, as the original worklog said. The env knob is kept as a diagnostic; the default is unchanged | **Rejected** |
@@ -202,57 +231,38 @@ and the decision, so rejected directions are not retried.
 | `ds4-e02-head-rope-wave` | Same treatment for `head_rms_norm_rope_tail_kernel`, the largest elementwise kernel at 7.27 ms per call, on the assumption that 256 threads per 128-element row wasted three quarters of the block on the `powf`/`cosf`/`sinf` tail | **Inert, then closed by arithmetic.** `head_dim` exceeds 256 so the guard never selected the new kernel. Recomputing with the real geometry: 262,144 rows x 512 floats, read twice and written once, is 1.6 GB, so 7.27 ms is **89% of roofline**. The 4.4x gap was an artefact of guessing `head_dim = 128`. The kernel was deleted rather than left behind a guard | **Rejected** |
 | `ds4-t01-transpose-tile` | `dequant_q8_0_to_f16_transpose_kernel` gives each lane the private output address `i * out_dim + row`, so a wave's 32 stores land 8,192 B apart: 32 cache lines for 64 B of payload, and `(8192 / 256) % 16 == 0` puts all of them on one memory channel — 1.9 GB/s measured, about 25x off roofline. Stage a 32-`i` x 64-`row` tile in LDS, keep reads wave-contiguous, write 64 consecutive halves, and put `row` on `blockIdx.x` so concurrent blocks span the full `out_dim` row and cover all 16 channels | Bit-identical by construction, and the kernel disappears from the top of the trace. **PP-neutral** (328.47 -> 328.46 at 4K over three alternating pairs): the 2,453 ms it removes is startup, in the phase before the first measured frontier, not inside it. Kept for the ~2.3 s it takes off first-prompt latency, but it is not a prefill win | **Retained, no PP gain** |
 
-### Where the remaining 5% is
+### Where the time now is
 
-Per-frontier kernel budget at the retained commit, from a two-chunk trace halved
-(measured phase is 99.8% GPU-busy, 21,341 ms for two frontiers):
+Per-frontier kernel budget at the retained commit, from a two-chunk trace halved.
+The measured phase is **99.8% GPU-busy**, so prefill is purely kernel-bound and
+there is no launch gap to recover.
 
 | Kernel | ms/frontier | Assessment |
 | --- | ---: | --- |
-| `mul_mat_q<IQ2_XXS,80>` gate/up | 2,188 | Bandwidth-bound at ~27 FLOP/byte; 20+ prior experiments, occupancy closed |
-| `moe_down_q2K_hotlist_wmma_wide` | 1,874 | Bandwidth-bound at ~30 FLOP/byte; MTILES=4 is a two-sided optimum |
-| `attention_mixed_heads32_wmma<true,true>` | 1,295 | **The one real target left.** See below |
-| `mul_mat_q<Q8_0,80>` dense | 930 | Not yet roofline-checked |
-| attention output A batched GEMM (rocBLAS) | 560 | 21.4 TFLOP/s, ~2x better than our kernel |
-| attention output B (our WMMA kernel) | 556 | 21.2 TFLOP/s, was 10.7 |
-| `attention_static_mixed_heads8_online` | 450 | 8 waves/SIMD, already single-pass |
-| Tensile `MT96x96` + `MT32x32` projections | 485 | Tensile wins these; measured twice |
-| `indexer_scores_wmma128` | 332 | 45,056 B LDS, **1 workgroup per CU**; -80 ms if it fits two |
-| `head_rms_norm_rope_tail` | 312 | 89% of roofline |
+| `mul_mat_q<IQ2_XXS,80>` gate/up | 2,182 | Bandwidth-bound at ~27 FLOP/byte; 20+ prior experiments, occupancy closed, X swept again here |
+| `moe_down_q2K_hotlist_wmma_wide` | 1,870 | Bandwidth-bound at ~30 FLOP/byte; MTILES=4 is a two-sided optimum |
+| `attention_mixed_heads32_wmma<true,true>` | 946 | Was 1,291. Single-pass; 58,368 B LDS still holds it to one workgroup per CU |
+| `mul_mat_q<Q8_0,80>` dense | 931 | **Never roofline-checked.** Largest unexamined item |
+| attention output A batched GEMM (rocBLAS) | 563 | 21.4 TFLOP/s, about 2x better than our own kernel on this shape |
+| attention output B (our WMMA kernel) | 551 | 21.2 TFLOP/s, was 10.7 |
+| `attention_static_mixed_heads8_online` | 450 | Two-pass, and a single pass was rejected on quality |
+| Tensile `MT96x96` + `MT32x32` projections | 487 | Tensile wins these; measured twice, isolated and in-app |
+| `indexer_scores_wmma128` | 331 | 45,056 B LDS, one workgroup per CU |
+| `head_rms_norm_rope_tail` | ~210 | Was 312; now one read and one write per row |
 
-`attention_mixed_heads32_wmma<true,true>` is the only large kernel with a
-structural inefficiency left, and it is a hard one. It walks **two full passes**
-over the KV rows: pass 0 for scores and the online softmax max/denominator, pass
-1 for the probabilities and PV. The score cache spares pass 1 the QK matrix
-multiply but not the KV staging, so every row block is staged, barriered and
-LDS-written twice. At 58,368 B of LDS the kernel is one workgroup per CU, so all
-32 waves walk that chain in lockstep.
-
-The obvious fix is a single-pass FlashAttention formulation that rescales the
-output accumulator by `exp(m_old - m_new)` instead of pre-computing a global
-maximum. **That is why the two-pass form exists**: the rescale has to reach
-individual *rows* of a rocWMMA F32 accumulator fragment, and rocWMMA exposes no
-row accessor, so it needs either exact knowledge of the RDNA3 WMMA C-matrix lane
-layout or a 32 KB LDS round trip per row block. Only about 6 KB of LDS is free.
-Estimated payoff -400 to -600 ms per frontier, which is the whole remaining gap;
-estimated risk high. This is the next thing to build, and it should be built
-against a standalone harness rather than in-tree.
-
-Also note the arithmetic that kills the cheap reading of this kernel: mma issue
-is only about 14% of its runtime (8.7 ms of a 62 ms call, counting 32 cycles per
-wave32 `v_wmma` per SIMD), so the 2-of-32-waves score phase is *not* the cost.
-It is latency and barriers. Any proposal here must model the barrier chain.
+The two MoE matmuls are now **53% of the frontier** and both are at the memory
+wall. Everything cheap outside them has been taken.
 
 ### Queued experiments
 
-Ordered by expected value. The BLAS seam that produced this session's gain is
-now closed in both directions.
+Ordered by expected value. The BLAS seam that produced part of this session's
+gain is now closed in both directions, and the attention seam is half-closed.
 
 | ID | Experiment | Predicted | Gate |
 | :--- | :--- | --- | --- |
-| `ds4-a02-attn-single-pass` | Collapse `attention_mixed_heads32_wmma`'s two KV passes into one with an accumulator rescale, as analysed above. Halves KV staging, barriers and LDS writes per row block, and deletes the score cache and its memory. Blocked on reaching accumulator rows: either hard-code the RDNA3 WMMA C-matrix lane layout (fast, brittle, must be asserted against a reference) or free 32 KB of LDS by staging 8 KV rows at a time instead of 16 | **-400 to -600 ms per frontier**, i.e. the whole remaining gap to 400 | Not bit-exact; needs logit envelope + a likelihood corpus. Build against a standalone harness first |
-| `ds4-a03-indexer-lds` | `indexer_scores_wmma128` uses 45,056 B of LDS with only 256 threads, so it is one workgroup and 4 waves per SIMD. Getting under 32,768 B doubles residency | -80 ms per frontier | Exact hashes likely |
-| `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 930 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything | Unknown; a counter read either opens or closes it | n/a, measurement only |
+| `ds4-d01-dense-q8-roofline` | `mul_mat_q<Q8_0,80>` is 931 ms per frontier over 215 calls per chunk and has never been roofline-checked. Establish its FLOP/byte before proposing anything. Now the largest unexamined kernel | Unknown; a counter read either opens or closes it | n/a, measurement only |
+| `ds4-a03-indexer-lds` | `indexer_scores_wmma128` uses 45,056 B of LDS with only 256 threads, so it is one workgroup and 4 waves per SIMD. `b_sh` alone is 32,768 B; halving the comp tile to 64 columns would fit two workgroups at the cost of doubling the `a_sh` re-reads | -60 to -80 ms per frontier | Changes the accumulation split; logit envelope |
+| `ds4-a07-mixed32-lds` | `attention_mixed_heads32_wmma` is still one workgroup per CU at 58,368 B, of which `q_half` is 33,024. Two workgroups needs 32,768 B total, which is unreachable while a block owns 32 heads. The prior 16-head split was measured at 1,428 -> 2,305 ms, so this needs a different decomposition, not a smaller one | Unknown; likely closed | — |
 | `ds4-m02-moe-64-row-tile` | The two MoE matmuls remain the **only** kernels that scale sub-linearly with chunk width: per token per layer, IQ2 gate/up costs 12.58 us at a 4,096-token chunk against 10.52 us at 8,192 (**-16.4%**), and Q2 down 10.68 against 9.46 (**-11.5%**); everything else is flat to within 1%. `ds4-m01` proved it is not column-tile fill, so it is the 64-row destination granularity and per-tile activation amortisation | -579 ms per frontier if 8,192-chunk efficiency is reached at 4,096 | Exact hashes if the tail arithmetic is unchanged |
 | `ds4-q01-repack-iq2` | Row-pair-interleaved 64 B-aligned IQ2 repack, the last untried fork idea. Removes 2-byte-aligned split loads | Unknown | Exact hashes; in place, no extra resident bytes |
 | `ds4-b01-blas-candidates` | The pinned hipBLASLt candidates (4/5/6) were chosen for determinism, not speed. Sweep the index and allow non-zero workspace | **Closed by the harness**: candidate 4 is within 4% of the best zero-workspace candidate on every shape, and a 64 MiB workspace unlocks no new solution — every candidate reports `workspaceSize = 0` | Closed |
